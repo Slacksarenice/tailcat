@@ -16,7 +16,10 @@
 // therefore runs on a goroutine and hands the page a Promise: closing a
 // node, say, waits for its in-flight fetches and WebSockets to end, and
 // those can only end on the event loop, so waiting for them in the
-// call itself would freeze the page.
+// call itself would freeze the page. A goroutine holds it too, for as
+// long as it runs without blocking: Go hands the thread back to the
+// page only once every goroutine waits on something. So no loop may
+// retry without waiting between attempts.
 package main
 
 import (
@@ -221,6 +224,12 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		if port == webrtcSignalPort {
 			return nil, fmt.Errorf("port %d is reserved for WebRTC signaling", port)
 		}
+		// A malformed address fails here, at once, rather than every
+		// ping attempt failing until the timeout.
+		ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+		if err != nil {
+			return nil, fmt.Errorf("invalid addr: %w", err)
+		}
 		priv := key.NewNode()
 		if keyJSON != "" {
 			var pk tailcat.PrivateKey
@@ -246,22 +255,23 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			cl.Close()
 			return nil, fmt.Errorf("DialTCPPort: %w", err)
 		}
-		var serverKey key.NodePublic
-		if ci, err := tailcat.ParseAddr(tailcat.Addr(addr)); err == nil {
-			serverKey = ci.ServerPublic.NodePublic
-		}
 		rtcCtx, stopRTC := context.WithCancel(context.Background())
 		go runRTCClient(rtcCtx, cl, opts, logf)
-		return makeJSConn(c, port, serverKey, func() {
+		return makeJSConn(c, port, ci.ServerPublic.NodePublic, func() {
 			stopRTC()
 			cl.Close()
 		}), nil
 	})
 }
 
+// pingRetryDelay is how long pingUntil waits after a failed attempt.
+const pingRetryDelay = 500 * time.Millisecond
+
 // pingUntil retries the meow/meowed handshake until it succeeds or
 // ctx expires. The first pings can be lost while either side's DERP
-// connection is still coming up.
+// connection is still coming up. It waits between attempts: one that
+// fails without blocking (a client that can't start fails every time)
+// would otherwise spin, holding the page's thread until ctx expires.
 func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 	for {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -270,8 +280,10 @@ func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 		if err == nil {
 			return nil
 		}
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return fmt.Errorf("ping: %w", err)
+		case <-time.After(pingRetryDelay):
 		}
 	}
 }
