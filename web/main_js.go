@@ -393,7 +393,13 @@ func makePromise(f func() (any, error)) js.Value {
 		}()
 		return nil
 	})
-	return js.Global().Get("Promise").New(handler)
+	// The Promise constructor calls handler before it returns, and
+	// never again. Released, it no longer keeps f alive, nor whatever f
+	// holds: for a write, a copy of the data. Kept, every byte a page
+	// writes would stay on the heap for the life of the program.
+	p := js.Global().Get("Promise").New(handler)
+	handler.Release()
+	return p
 }
 
 func rejectedPromise(err error) js.Value {

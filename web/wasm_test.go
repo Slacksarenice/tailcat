@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/tailscale/tailcat"
@@ -438,6 +439,113 @@ func TestBrowserSends(t *testing.T) {
 	}
 	if got.sum != sentSum {
 		t.Errorf("server received sha256 %v; browser sent %v", got.sum, sentSum)
+	}
+	checkPageErrors(t, runCtx)
+}
+
+// wasmMemScript, run in a page before its own scripts, notes the Go
+// program's WebAssembly memory as the page instantiates it, so a test
+// can read its size in bytes from window.tcWasmMemBytes() (-1 until
+// the program is loaded).
+const wasmMemScript = `(() => {
+  let mem = null;
+  const keep = (r) => {
+    const inst = r.instance || r;
+    if (inst.exports && inst.exports.mem) mem = inst.exports.mem;
+    return r;
+  };
+  const inst = WebAssembly.instantiate, instS = WebAssembly.instantiateStreaming;
+  WebAssembly.instantiate = (...a) => inst.apply(WebAssembly, a).then(keep);
+  if (instS) WebAssembly.instantiateStreaming = (...a) => instS.apply(WebAssembly, a).then(keep);
+  window.tcWasmMemBytes = () => mem ? mem.buffer.byteLength : -1;
+})();`
+
+// TestBrowserSendKeepsNoCopy sends a tab's worth of data to a Go
+// server and checks that the tab's Go memory grew by well under what
+// it sent. Each write copies its data into Go, so a write that kept
+// its copy (as one did while its promise's callback was never
+// released) would grow the memory by all of it, until the tab ran out.
+func TestBrowserSendKeepsNoCopy(t *testing.T) {
+	const size = 64 << 20
+	bin := preflight(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	s := &tailcat.Server{Logf: mkLogf(t, "server"), Region: dm.Regions[1]}
+	t.Cleanup(func() { s.Close() })
+	recvc := make(chan int64, 1)
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return func(c net.Conn) {
+			defer c.Close()
+			n, err := io.Copy(io.Discard, c)
+			if err != nil {
+				t.Errorf("server read: %v", err)
+			}
+			select {
+			case recvc <- n:
+			default:
+			}
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Server.Start: %v", err)
+	}
+
+	browserCtx := launchChrome(t, bin)
+	runCtx, cancelRun := context.WithTimeout(browserCtx, 180*time.Second)
+	t.Cleanup(cancelRun)
+
+	var before, after, sentBytes int
+	var ok bool
+	run := func(name string, actions ...chromedp.Action) {
+		t.Helper()
+		if err := chromedp.Run(runCtx, actions...); err != nil {
+			var state string
+			ctx, cancel := context.WithTimeout(runCtx, 5*time.Second)
+			chromedp.Run(ctx, chromedp.Evaluate(`JSON.stringify({tcTest: window.tcTest, mem: window.tcWasmMemBytes && window.tcWasmMemBytes()})`, &state))
+			cancel()
+			t.Fatalf("%s: %v (page: %s)", name, err, state)
+		}
+	}
+	// The gate holds the data until the test has noted the memory the
+	// page started with.
+	run("loading the page",
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, err := page.AddScriptToEvaluateOnNewDocument(wasmMemScript).Do(ctx)
+			return err
+		}),
+		chromedp.Navigate(srv.URL+"/?"+url.Values{
+			"mode":  {"send"},
+			"addr":  {string(s.TailcatAddr())},
+			"bytes": {strconv.Itoa(size)},
+			"gate":  {""},
+		}.Encode()),
+		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ok,
+			chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(120*time.Second)),
+		chromedp.Evaluate("window.tcWasmMemBytes()", &before),
+	)
+	if before <= 0 {
+		t.Fatalf("the page's Go memory reads %d; want its size", before)
+	}
+	run("sending",
+		chromedp.Evaluate("window.tcTest.go = true", nil),
+		chromedp.Poll("window.tcTest.sendDone === true", &ok,
+			chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(150*time.Second)),
+		chromedp.Evaluate("window.tcWasmMemBytes()", &after),
+		chromedp.Evaluate("window.tcTest.sentBytes", &sentBytes),
+	)
+
+	select {
+	case n := <-recvc:
+		if n != size || sentBytes != size {
+			t.Errorf("server received %d bytes, browser sent %d; want %d", n, sentBytes, size)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Go server never finished receiving")
+	}
+	t.Logf("the page's Go memory: %d MiB before sending %d MiB, %d MiB after", before>>20, size>>20, after>>20)
+	if grew := after - before; grew > size/2 {
+		t.Errorf("the page's Go memory grew by %d MiB over sending %d MiB; want under %d MiB", grew>>20, size>>20, size>>21)
 	}
 	checkPageErrors(t, runCtx)
 }
