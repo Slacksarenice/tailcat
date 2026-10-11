@@ -42,9 +42,19 @@ https://tailcat.dev/derpmap.json) or you can [run your own](https://github.com/t
 
 There's also an experimental in-browser web demo (tailcat compiled to
 WebAssembly) at https://tailscale.github.io/tailcat/ that can send and
-receive files or text, interoperating with the CLI. Browser traffic is
-relayed over DERP only, with no direct connections until WebRTC
-support ([#4](https://github.com/tailscale/tailcat/issues/4)).
+receive files or text, interoperating with the CLI. Browsers can't
+open UDP sockets, so browser traffic is relayed over DERP, except
+between two browsers that both enable the web app's `webrtc` option:
+their tunnel then moves to a direct WebRTC DataChannel when one can
+be opened ([#4](https://github.com/tailscale/tailcat/issues/4)). The
+WebRTC offer, answer and ICE candidates travel inside the existing
+WireGuard tunnel (port 65534), so no signaling server is involved; the
+DataChannel carries the tunnel's WireGuard datagrams, and if it fails
+they fall back to DERP without breaking open connections. See
+`web/main_js.go` for the JavaScript API and `web/webrtc_js.go` for the
+details. The wasm build (`go run ./cmd/tailcat-webdist`) gets this
+from a small hook it patches into a copy of tailscale.com's magicsock
+(see `internal/wasmbuild`); other builds are unaffected.
 
 ## Install
 

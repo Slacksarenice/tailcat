@@ -7,6 +7,50 @@ const KEY_STORAGE = "tailcat-web-key";
 const params = new URLSearchParams(location.search);
 const verbose = params.has("verbose");
 
+// tcTest is the state surface polled by the headless-browser
+// integration test (web/wasm_test.go). It is set up before the
+// module's first await, so it exists as soon as the page has loaded.
+window.tcTest = {
+  ready: false,
+  listenAddr: null,
+  recvBytes: 0,
+  recvSha256: null,
+  recvDone: false,
+  sentBytes: 0,
+  sentSha256: null,
+  sendDone: false,
+  path: null, // "webrtc" or "derp" once reported
+  go: false,  // with ?gate, the sender waits for the test to set this
+  errors: [],
+};
+window.addEventListener("error", (e) => window.tcTest.errors.push(String(e.message)));
+window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(String(e.reason)));
+
+if (params.has("webrtc")) {
+  document.getElementById("use-webrtc").checked = true;
+}
+
+// webrtcOption returns the "webrtc" option for tailcatListen and
+// tailcatDial: off unless the checkbox (or ?webrtc) enables it, and
+// with ?webrtc=host, host candidates only (no STUN), as the tests use.
+function webrtcOption() {
+  if (!document.getElementById("use-webrtc").checked) {
+    return false;
+  }
+  return params.get("webrtc") === "host" ? { iceServers: [] } : true;
+}
+
+// onPathChange shows whether traffic flows over a direct WebRTC path
+// or through DERP.
+function onPathChange({ peerKey, path }) {
+  window.tcTest.path = path;
+  document.getElementById("path").textContent =
+    path === "webrtc" ? "· direct (WebRTC)" : "· relayed (DERP)";
+  if (verbose) {
+    console.log(`path to ${peerKey}: ${path}`);
+  }
+}
+
 // canonicalDERPMapURL is the public tailcat DERP map, which allows
 // cross-origin fetches with CORS headers.
 const canonicalDERPMapURL = "https://tailcat.dev/derpmap.json";
@@ -35,22 +79,6 @@ async function pickDERPMapURL() {
   return canonicalDERPMapURL;
 }
 const derpMapURL = await pickDERPMapURL();
-
-// tcTest is the state surface polled by the headless-browser
-// integration test (web/wasm_test.go).
-window.tcTest = {
-  ready: false,
-  listenAddr: null,
-  recvBytes: 0,
-  recvSha256: null,
-  recvDone: false,
-  sentBytes: 0,
-  sentSha256: null,
-  sendDone: false,
-  errors: [],
-};
-window.addEventListener("error", (e) => window.tcTest.errors.push(String(e.message)));
-window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(String(e.reason)));
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $("status").textContent = msg; };
@@ -139,7 +167,10 @@ async function startListener() {
   const persist = $("persist-key").checked;
   const privateKey = persist ? (localStorage.getItem(KEY_STORAGE) || "") : "";
   try {
-    const ln = await tailcatListen({ derpMapURL, privateKey, verbose, onConnection });
+    const ln = await tailcatListen({
+      derpMapURL, privateKey, verbose, onConnection,
+      webrtc: webrtcOption(), onPathChange,
+    });
     if (persist) {
       localStorage.setItem(KEY_STORAGE, ln.privateKeyJSON);
     }
@@ -261,8 +292,27 @@ $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").te
 
 // --- Send side ---
 
+// until resolves once cond() is true, checking every 100ms.
+async function until(cond) {
+  while (!cond()) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 async function sendStream(addr, size, readChunk, progressEl) {
-  const conn = await tailcatDial({ addr, derpMapURL, verbose });
+  const conn = await tailcatDial({
+    addr, derpMapURL, verbose,
+    webrtc: webrtcOption(), onPathChange,
+  });
+  // Test hooks: ?waitpath=webrtc holds the data until the direct path
+  // is up, and ?gate until the test sets tcTest.go (after stopping the
+  // DERP server, to prove the data doesn't need it).
+  if (params.get("waitpath")) {
+    await until(() => window.tcTest.path === params.get("waitpath"));
+  }
+  if (params.has("gate")) {
+    await until(() => window.tcTest.go);
+  }
   let off = 0;
   while (off < size) {
     const chunk = await readChunk(off, Math.min(CHUNK, size - off));

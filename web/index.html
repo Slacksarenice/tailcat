@@ -23,11 +23,15 @@
 <h1>tailcat</h1>
 <p class="notice">This is an experimental demo of
 <a href="https://github.com/tailscale/tailcat/">tailcat</a> in the
-browser. Unlike the normal CLI and non-JS library versions, all of
-its traffic is relayed through DERP
-servers; browsers can't make tailcat's direct peer-to-peer
-connections without WebRTC support
+browser. Browsers can't open the UDP sockets that tailcat's direct
+peer-to-peer connections use, so its traffic is relayed through DERP
+servers, unless both sides are this page with the WebRTC option
+below on: then it moves to a direct WebRTC connection between the
+browsers when one can be made, falling back to DERP if not
 (<a href="https://github.com/tailscale/tailcat/issues/4">issue #4</a>).</p>
+<p><label><input type="checkbox" id="use-webrtc"> Use a direct WebRTC
+path when the other side is this page too (leave off when sending to
+the CLI)</label> <span id="path"></span></p>
 <p id="status">Loading WebAssembly…</p>
 <progress id="load-progress" max="1" value="0"></progress>
 
