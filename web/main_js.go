@@ -129,7 +129,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			// any port and hand it to the page.
 			return func(c net.Conn) {
 				peer, _ := srv.PeerKey(c.RemoteAddr())
-				onConnection.Invoke(makeJSConn(c, port, peer, nil))
+				invokeSafely("onConnection", onConnection, makeJSConn(c, port, peer, nil))
 			}
 		}
 		if err := srv.Start(); err != nil {
@@ -367,4 +367,16 @@ func makePromise(f func() (any, error)) js.Value {
 
 func rejectedPromise(err error) js.Value {
 	return js.Global().Get("Promise").Call("reject", js.Global().Get("Error").New(err.Error()))
+}
+
+// invokeSafely calls the page's callback f, named name. If it throws,
+// the error is logged: left to panic, it would end the program and
+// every tunnel in it.
+func invokeSafely(name string, f js.Value, args ...any) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("tailcat: %s threw: %v", name, r)
+		}
+	}()
+	f.Invoke(args...)
 }

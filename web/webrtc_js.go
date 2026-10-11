@@ -80,12 +80,31 @@ const (
 
 	// maxBuffered is how much a DataChannel may hold unsent before
 	// datagrams are dropped, as a full UDP socket would; inner TCP
-	// then slows down.
-	maxBuffered = 1 << 20
+	// then slows down. It is kept small because pings queue behind it.
+	maxBuffered = 256 << 10
 	maxFrame    = frameHeaderLen + 65535
+
+	// qualifyTimeout is how long, from the start of signaling, a
+	// session may take to qualify its channel before either side gives
+	// up on it.
+	qualifyTimeout = signalTimeout + probeTimeout + 5*time.Second
+	// maxPendingCands caps the ICE candidates held while waiting for
+	// the description they follow.
+	maxPendingCands = 64
+	// minSessionGap paces how often one peer may start a signaling
+	// session with a listener; a client renegotiates no more often than
+	// every minRetry. A stream that would wait longer than
+	// maxSessionWait for its turn is refused.
+	minSessionGap  = minRetry / 2
+	maxSessionWait = 5 * time.Second
 
 	minRetry = 2 * time.Second
 	maxRetry = 60 * time.Second
+)
+
+var (
+	jsArrayBuffer = js.Global().Get("ArrayBuffer")
+	jsUint8Array  = js.Global().Get("Uint8Array")
 )
 
 // rtcOptions is the parsed "webrtc" option of tailcatListen and
@@ -141,39 +160,51 @@ func newPathNotifier(opts js.Value) pathNotifier {
 		return func(key.NodePublic, string) {}
 	}
 	return func(peer key.NodePublic, path string) {
-		f.Invoke(js.ValueOf(map[string]any{"peerKey": peer.String(), "path": path}))
+		invokeSafely("onPathChange", f, map[string]any{"peerKey": peer.String(), "path": path})
 	}
 }
 
 // awaitPromise blocks the calling goroutine (never a JS callback)
-// until the JavaScript promise p settles.
-func awaitPromise(p js.Value) (js.Value, error) {
+// until the JavaScript promise p settles or ctx ends. An
+// RTCPeerConnection may leave its operations' promises pending forever
+// once closed, so callers pass the session's context. The callbacks
+// release themselves when the promise settles, so an abandoned one
+// keeps only them alive, and only until then.
+func awaitPromise(ctx context.Context, p js.Value) (js.Value, error) {
 	type result struct {
 		v   js.Value
 		err error
 	}
-	ch := make(chan result, 1)
-	then := js.FuncOf(func(this js.Value, args []js.Value) any {
+	ch := make(chan result, 1) // the promise settles at most once
+	var then, catch js.Func
+	settle := func(r result) {
+		then.Release()
+		catch.Release()
+		ch <- r
+	}
+	then = js.FuncOf(func(this js.Value, args []js.Value) any {
 		v := js.Undefined()
 		if len(args) > 0 {
 			v = args[0]
 		}
-		ch <- result{v: v}
+		settle(result{v: v})
 		return nil
 	})
-	catch := js.FuncOf(func(this js.Value, args []js.Value) any {
+	catch = js.FuncOf(func(this js.Value, args []js.Value) any {
 		msg := "promise rejected"
 		if len(args) > 0 {
 			msg = jsErrorString(args[0])
 		}
-		ch <- result{err: errors.New(msg)}
+		settle(result{err: errors.New(msg)})
 		return nil
 	})
-	defer then.Release()
-	defer catch.Release()
 	p.Call("then", then, catch)
-	r := <-ch
-	return r.v, r.err
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-ctx.Done():
+		return js.Undefined(), ctx.Err()
+	}
 }
 
 func jsErrorString(v js.Value) string {
@@ -217,21 +248,26 @@ type rtcSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// The fields below are only touched from JS callbacks and the
-	// session's goroutines, which js/wasm runs one at a time, but mu
-	// keeps them correct regardless.
+	// notifyMu orders the "webrtc" and "derp" path notifications, so
+	// the page never hears them out of order.
+	notifyMu sync.Mutex
+
+	// mu guards the fields below, which JS callbacks and the session's
+	// goroutines share.
 	mu            sync.Mutex
 	dc            js.Value
 	path          *tailcat.PacketPath
+	qualifying    bool // qualify has started
 	qualified     bool
 	probeAcks     int
 	pingSeq       uint32
-	pingSentAt    time.Time // of the oldest unanswered ping; zero if none
+	pingWaitSeq   uint32    // sequence of the ping that started the current wait
+	pingSentAt    time.Time // when the current wait for a pong began; zero if none
 	remoteSet     bool
 	pendingCands  []json.RawMessage
 	sendScratch   []byte
 	sendBuf       js.Value // reusable Uint8Array for outgoing frames
-	recvScratch   []byte
+	recvScratch   []byte   // used only by onMessage, a JS callback
 	everQualified bool
 }
 
@@ -252,7 +288,7 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 		ctx:         ctx,
 		cancel:      cancel,
 		sendScratch: make([]byte, maxFrame),
-		sendBuf:     js.Global().Get("Uint8Array").New(maxFrame),
+		sendBuf:     jsUint8Array.New(maxFrame),
 		recvScratch: make([]byte, maxFrame),
 		dc:          js.Undefined(),
 	}
@@ -292,9 +328,17 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 	return s, nil
 }
 
-// on sets an event handler property, remembering it for release.
+// on sets an event handler property, remembering it for release. A
+// panic in fn, which would otherwise end the program and every tunnel
+// in it, ends just this session.
 func (s *rtcSession) on(target js.Value, prop string, fn func(ev js.Value)) {
 	f := js.FuncOf(func(this js.Value, args []js.Value) any {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logf("webrtc: %s handler: %v", prop, r)
+				s.close()
+			}
+		}()
 		ev := js.Undefined()
 		if len(args) > 0 {
 			ev = args[0]
@@ -364,7 +408,7 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		if err != nil {
 			return err
 		}
-		if _, err := awaitPromise(p); err != nil {
+		if _, err := awaitPromise(s.ctx, p); err != nil {
 			return err
 		}
 		s.mu.Lock()
@@ -380,7 +424,7 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 			if err != nil {
 				return err
 			}
-			if _, err := awaitPromise(p); err != nil {
+			if _, err := awaitPromise(s.ctx, p); err != nil {
 				return err
 			}
 			s.sendSignal(signalMsg{T: "answer", SDP: s.pc.Get("localDescription").Get("sdp").String()})
@@ -390,6 +434,10 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		s.mu.Lock()
 		if !s.remoteSet {
 			// Candidates can overtake the description they follow.
+			if len(s.pendingCands) >= maxPendingCands {
+				s.mu.Unlock()
+				return errors.New("too many candidates before the description")
+			}
 			s.pendingCands = append(s.pendingCands, m.Cand)
 			s.mu.Unlock()
 			return nil
@@ -410,7 +458,7 @@ func (s *rtcSession) addCandidate(c json.RawMessage) {
 	if err != nil {
 		return
 	}
-	if _, err := awaitPromise(p); err != nil {
+	if _, err := awaitPromise(s.ctx, p); err != nil && s.ctx.Err() == nil {
 		s.logf("webrtc: addIceCandidate: %v", err)
 	}
 }
@@ -433,18 +481,22 @@ func (s *rtcSession) offer() error {
 	if err != nil {
 		return err
 	}
-	if _, err := awaitPromise(p); err != nil {
+	if _, err := awaitPromise(s.ctx, p); err != nil {
 		return err
 	}
 	s.sendSignal(signalMsg{T: "offer", SDP: s.pc.Get("localDescription").Get("sdp").String()})
 	return nil
 }
 
-// acceptChannel waits for the dialer's DataChannel; the listener calls it.
+// acceptChannel waits for the dialer's DataChannel; the listener calls
+// it. A session carries one channel, so any others are closed.
 func (s *rtcSession) acceptChannel() {
 	s.on(s.pc, "ondatachannel", func(ev js.Value) {
 		dc := ev.Get("channel")
-		if dc.Get("label").String() != dataChannelName {
+		s.mu.Lock()
+		taken := !s.dc.IsUndefined()
+		s.mu.Unlock()
+		if taken || dc.Get("label").String() != dataChannelName {
 			dc.Call("close")
 			return
 		}
@@ -501,7 +553,10 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	b[0] = frameWG
 	copy(b[frameHeaderLen:], pkt)
 	if !s.sendFrameLocked(b) {
+		// The channel is gone; end the session, which withdraws the
+		// path and tells the page, rather than leave it half up.
 		s.qualified = false
+		s.close()
 		return false
 	}
 	return true
@@ -510,13 +565,18 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 // onMessage handles a DataChannel message. It runs in a JS callback,
 // so it must not block.
 func (s *rtcSession) onMessage(data js.Value) {
-	u8 := js.Global().Get("Uint8Array").New(data)
-	n := u8.Get("length").Int()
+	// binaryType governs only binary messages, and the peer can send
+	// text too. Text must not reach the Uint8Array constructor, which
+	// would read a numeric string as a length to allocate (or throw).
+	if !data.InstanceOf(jsArrayBuffer) {
+		return
+	}
+	n := data.Get("byteLength").Int()
 	if n < frameHeaderLen || n > maxFrame {
 		return
 	}
 	b := s.recvScratch[:n]
-	js.CopyBytesToGo(b, u8)
+	js.CopyBytesToGo(b, jsUint8Array.New(data))
 	switch b[0] {
 	case frameWG:
 		s.mu.Lock()
@@ -542,8 +602,11 @@ func (s *rtcSession) onMessage(data js.Value) {
 		if n < frameHeaderLen+4 {
 			return
 		}
+		// Any pong to a ping sent since the wait began proves the
+		// channel alive, even while later pings still queue behind
+		// datagrams on a slow uplink.
 		s.mu.Lock()
-		if binary.BigEndian.Uint32(b[1:]) == s.pingSeq {
+		if !s.pingSentAt.IsZero() && int32(binary.BigEndian.Uint32(b[1:])-s.pingWaitSeq) >= 0 {
 			s.pingSentAt = time.Time{}
 		}
 		s.mu.Unlock()
@@ -556,10 +619,11 @@ func (s *rtcSession) onMessage(data js.Value) {
 // side's sending to it, and then watches it with pings.
 func (s *rtcSession) qualify() {
 	s.mu.Lock()
-	if s.path != nil {
+	if s.qualifying {
 		s.mu.Unlock()
 		return
 	}
+	s.qualifying = true
 	s.mu.Unlock()
 	path, err := s.newPath(s.sendWG)
 	if err != nil {
@@ -568,6 +632,13 @@ func (s *rtcSession) qualify() {
 		return
 	}
 	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		// teardown has run or will find no path; don't leave this
+		// one installed.
+		s.mu.Unlock()
+		path.Close()
+		return
+	}
 	s.path = path
 	s.mu.Unlock()
 
@@ -591,13 +662,36 @@ func (s *rtcSession) qualify() {
 		case <-time.After(probeInterval):
 		}
 	}
+	s.notifyMu.Lock()
 	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		s.notifyMu.Unlock()
+		return
+	}
 	s.qualified = true
 	s.everQualified = true
 	s.mu.Unlock()
 	s.logf("webrtc: direct path to %v up", s.peer.ShortString())
 	s.notify(s.peer, "webrtc")
+	s.notifyMu.Unlock()
 	s.watch()
+}
+
+// giveUpUnlessQualified ends the session if its channel hasn't
+// qualified within qualifyTimeout.
+func (s *rtcSession) giveUpUnlessQualified() {
+	select {
+	case <-s.ctx.Done():
+	case <-time.After(qualifyTimeout):
+		s.mu.Lock()
+		up := s.everQualified
+		s.mu.Unlock()
+		if !up {
+			s.logf("webrtc: no direct path to %v; staying on DERP for now", s.peer.ShortString())
+			s.close()
+		}
+	}
 }
 
 // watch pings the peer over the channel until it stops answering or
@@ -627,6 +721,7 @@ func (s *rtcSession) watch() {
 			seq := s.pingSeq
 			if s.pingSentAt.IsZero() {
 				s.pingSentAt = now
+				s.pingWaitSeq = seq
 			}
 			s.mu.Unlock()
 			s.sendControl(framePing, seq, 0)
@@ -639,8 +734,11 @@ func (s *rtcSession) close() { s.cancel() }
 
 // teardown runs once, when the session's context ends.
 func (s *rtcSession) teardown() {
+	s.notifyMu.Lock()
 	s.mu.Lock()
-	path, wasUp := s.path, s.qualified
+	// The page heard "webrtc" if and only if the session ever
+	// qualified, even if a failed send has since unqualified it.
+	path, wasUp := s.path, s.everQualified
 	s.path, s.qualified = nil, false
 	dc := s.dc
 	funcs := s.funcs
@@ -652,6 +750,7 @@ func (s *rtcSession) teardown() {
 	if wasUp {
 		s.notify(s.peer, "derp")
 	}
+	s.notifyMu.Unlock()
 	s.signal.Close()
 	for _, target := range []js.Value{dc, s.pc} {
 		if target.IsUndefined() {
@@ -677,8 +776,9 @@ type rtcServer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu       sync.Mutex
-	sessions map[key.NodePublic]*rtcSession
+	mu        sync.Mutex
+	sessions  map[key.NodePublic]*rtcSession
+	nextStart map[key.NodePublic]time.Time // earliest each peer's next session may start
 }
 
 // newRTCServer returns srv's WebRTC signaling handler, or nil if the
@@ -690,21 +790,56 @@ func newRTCServer(srv *tailcat.Server, opts js.Value, region *tailcfg.DERPRegion
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &rtcServer{
-		srv:      srv,
-		opts:     o,
-		region:   region,
-		logf:     logf,
-		notify:   newPathNotifier(opts),
-		ctx:      ctx,
-		cancel:   cancel,
-		sessions: map[key.NodePublic]*rtcSession{},
+		srv:       srv,
+		opts:      o,
+		region:    region,
+		logf:      logf,
+		notify:    newPathNotifier(opts),
+		ctx:       ctx,
+		cancel:    cancel,
+		sessions:  map[key.NodePublic]*rtcSession{},
+		nextStart: map[key.NodePublic]time.Time{},
+	}
+}
+
+// waitTurn paces peer's signaling sessions to one per minSessionGap,
+// since each builds an RTCPeerConnection. It reports false if the
+// stream should be refused instead: its turn is too far off, or the
+// server closed while it waited.
+func (r *rtcServer) waitTurn(peer key.NodePublic) bool {
+	now := time.Now()
+	r.mu.Lock()
+	for k, t := range r.nextStart {
+		if t.Before(now) {
+			delete(r.nextStart, k)
+		}
+	}
+	start := now
+	if t, ok := r.nextStart[peer]; ok && t.After(now) {
+		start = t
+	}
+	wait := start.Sub(now)
+	if wait > maxSessionWait {
+		r.mu.Unlock()
+		return false
+	}
+	r.nextStart[peer] = start.Add(minSessionGap)
+	r.mu.Unlock()
+	if wait == 0 {
+		return true
+	}
+	select {
+	case <-time.After(wait):
+		return true
+	case <-r.ctx.Done():
+		return false
 	}
 }
 
 // handleSignal serves one signaling stream from a client.
 func (r *rtcServer) handleSignal(c net.Conn) {
 	peer, ok := r.srv.PeerKey(c.RemoteAddr())
-	if !ok {
+	if !ok || !r.waitTurn(peer) {
 		c.Close()
 		return
 	}
@@ -737,6 +872,7 @@ func (r *rtcServer) handleSignal(c net.Conn) {
 	r.sessions[peer] = sess
 	r.mu.Unlock()
 	sess.acceptChannel()
+	go sess.giveUpUnlessQualified()
 	sess.readSignals(br, true)
 	<-sess.ctx.Done()
 	r.mu.Lock()
@@ -758,13 +894,22 @@ func (r *rtcServer) disconnect(peer key.NodePublic) {
 
 func (r *rtcServer) close() { r.cancel() }
 
-// errNoWebRTCPeer means the server doesn't do WebRTC: it isn't this web
-// app, or it is with WebRTC disabled.
-var errNoWebRTCPeer = errors.New("peer doesn't support WebRTC")
+var (
+	// errNoWebRTCPeer means the server answered signaling with
+	// something other than this web app's reply.
+	errNoWebRTCPeer = errors.New("peer doesn't support WebRTC")
+	// errNoSignaling means the server didn't complete the signaling
+	// preamble: the dial or the exchange failed, as against a server
+	// that isn't this web app or has WebRTC disabled, or over a tunnel
+	// that is briefly down.
+	errNoSignaling = errors.New("peer didn't answer WebRTC signaling")
+)
 
 // runRTCClient keeps a WebRTC session to cl's server for as long as
 // ctx lasts, renegotiating with backoff when one fails, unless the
-// server turns out not to support WebRTC.
+// server turns out not to support WebRTC: it answers signaling wrongly,
+// or never answers it at all. Once it has answered, later failures are
+// taken as transient (a network change, say) and retried.
 func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf logger.Logf) {
 	o := parseRTCOptions(opts)
 	if !o.enabled {
@@ -776,14 +921,17 @@ func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf l
 	}
 	notify := newPathNotifier(opts)
 	backoff := minRetry
+	answered := false
 	for ctx.Err() == nil {
 		start := time.Now()
-		err := rtcClientSession(ctx, cl, peer, o, notify, logf)
-		if errors.Is(err, errNoWebRTCPeer) {
+		ok, err := rtcClientSession(ctx, cl, peer, o, notify, logf)
+		answered = answered || ok
+		switch {
+		case errors.Is(err, errNoWebRTCPeer),
+			errors.Is(err, errNoSignaling) && !answered:
 			logf("webrtc: %v; staying on DERP", err)
 			return
-		}
-		if err != nil && ctx.Err() == nil {
+		case err != nil && ctx.Err() == nil:
 			logf("webrtc: %v", err)
 		}
 		if time.Since(start) > 2*maxRetry {
@@ -798,24 +946,25 @@ func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf l
 	}
 }
 
-// rtcClientSession runs one WebRTC session to cl's server until it ends.
-func rtcClientSession(ctx context.Context, cl *tailcat.Client, peer key.NodePublic, o rtcOptions, notify pathNotifier, logf logger.Logf) error {
+// rtcClientSession runs one WebRTC session to cl's server until it
+// ends. answered reports whether the server completed the signaling
+// preamble.
+func rtcClientSession(ctx context.Context, cl *tailcat.Client, peer key.NodePublic, o rtcOptions, notify pathNotifier, logf logger.Logf) (answered bool, err error) {
 	dctx, cancel := context.WithTimeout(ctx, signalTimeout)
 	c, err := cl.DialTCPPort(dctx, webrtcSignalPort)
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return false, ctx.Err()
 		}
-		// A refused or unanswered dial over a working tunnel means
-		// the server doesn't serve signaling.
-		return fmt.Errorf("%w (dialing signaling port: %v)", errNoWebRTCPeer, err)
+		// A refused or unanswered dial: the server doesn't serve
+		// signaling, or the tunnel is down for now.
+		return false, fmt.Errorf("%w (dialing signaling port: %v)", errNoSignaling, err)
 	}
-	// Any failure of the preamble exchange (a reset, an early close,
-	// a reply that isn't ours, or no reply from, say, a native tailcat
-	// server piping connections to its output) also means the server
-	// doesn't do WebRTC. A WebRTC-capable web server answers at once;
-	// retrying anything else would only repeat the preamble at it.
+	// A WebRTC-capable web server answers the preamble at once. A
+	// reset, an early close, or no reply (from, say, a native tailcat
+	// server piping connections to its output) means it isn't one, or
+	// the tunnel is down for now; any other reply means it isn't one.
 	c.SetDeadline(time.Now().Add(signalTimeout))
 	br := bufio.NewReader(c)
 	_, err = io.WriteString(c, signalPreamble)
@@ -825,38 +974,27 @@ func rtcClientSession(ctx context.Context, cl *tailcat.Client, peer key.NodePubl
 	}
 	if err != nil || line != signalAccept {
 		c.Close()
-		if ctx.Err() != nil {
-			return ctx.Err()
+		switch {
+		case ctx.Err() != nil:
+			return false, ctx.Err()
+		case err != nil:
+			return false, fmt.Errorf("%w (preamble: %v)", errNoSignaling, err)
 		}
-		return errNoWebRTCPeer
+		return false, errNoWebRTCPeer
 	}
 	c.SetDeadline(time.Time{})
 
 	sess, err := newRTCSession(ctx, logf, peer, c, o.iceServersFor(cl.DERPRegion()), notify, cl.NewPacketPath)
 	if err != nil {
 		c.Close()
-		return err
+		return true, err
 	}
 	if err := sess.offer(); err != nil {
 		sess.close()
-		return fmt.Errorf("offer: %w", err)
+		return true, fmt.Errorf("offer: %w", err)
 	}
 	go sess.readSignals(br, false)
-
-	// Give up on a session whose channel never qualifies.
-	go func() {
-		select {
-		case <-sess.ctx.Done():
-		case <-time.After(signalTimeout + probeTimeout + 5*time.Second):
-			sess.mu.Lock()
-			up := sess.everQualified
-			sess.mu.Unlock()
-			if !up {
-				logf("webrtc: no direct path to %v; staying on DERP for now", peer.ShortString())
-				sess.close()
-			}
-		}
-	}()
+	go sess.giveUpUnlessQualified()
 	<-sess.ctx.Done()
-	return nil
+	return true, nil
 }

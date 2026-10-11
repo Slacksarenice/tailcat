@@ -50,7 +50,10 @@ be opened ([#4](https://github.com/tailscale/tailcat/issues/4)). The
 WebRTC offer, answer and ICE candidates travel inside the existing
 WireGuard tunnel (port 65534), so no signaling server is involved; the
 DataChannel carries the tunnel's WireGuard datagrams, and if it fails
-they fall back to DERP without breaking open connections. See
+they fall back to DERP without breaking open connections. Unlike a
+DERP-only tunnel, this shows each end's public IP address (in its ICE
+candidates) to the other end, that is, to anyone holding the
+listener's address. See
 `web/main_js.go` for the JavaScript API and `web/webrtc_js.go` for the
 details. The wasm build (`go run ./cmd/tailcat-webdist`) gets this
 from a small hook it patches into a copy of tailscale.com's magicsock
