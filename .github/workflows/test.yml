@@ -3,8 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
+  # Every pull request, including those based on another branch, as in
+  # a stack of pull requests.
   pull_request:
-    branches: [main]
 
 jobs:
   test:

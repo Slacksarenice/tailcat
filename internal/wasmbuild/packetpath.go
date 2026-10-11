@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -75,20 +76,32 @@ var packetPathEdits = []magicsockEdit{
 	},
 }
 
-// goList runs "go list -m -f format mod" in the current directory.
-func goList(format, mod string) (string, error) {
-	out, err := exec.Command("go", "list", "-m", "-f", format, mod).Output()
+// downloadModule returns the version of module mod that the main module
+// in the current directory requires, and the module cache directory
+// holding it, downloading it first if needed. ("go list -m" would
+// report an empty directory for a module not yet downloaded, as in a
+// fresh clone.)
+func downloadModule(mod string) (version, dir string, err error) {
+	out, err := exec.Command("go", "mod", "download", "-json", mod).Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("go list -m %s: %v\n%s", mod, err, ee.Stderr)
+			return "", "", fmt.Errorf("go mod download %s: %v\n%s%s", mod, err, out, ee.Stderr)
 		}
-		return "", fmt.Errorf("go list -m %s: %w", mod, err)
+		return "", "", fmt.Errorf("go mod download %s: %w", mod, err)
 	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return "", fmt.Errorf("go list -m -f %q %s: empty result", format, mod)
+	var m struct {
+		Version, Dir, Error string
 	}
-	return s, nil
+	if err := json.Unmarshal(out, &m); err != nil {
+		return "", "", fmt.Errorf("go mod download %s: %w", mod, err)
+	}
+	if m.Error != "" {
+		return "", "", fmt.Errorf("go mod download %s: %s", mod, m.Error)
+	}
+	if m.Version == "" || m.Dir == "" {
+		return "", "", fmt.Errorf("go mod download %s: no version or directory in %s", mod, out)
+	}
+	return m.Version, m.Dir, nil
 }
 
 // applyEdits returns src with every edit for file applied.
@@ -128,11 +141,7 @@ func patchHash() string {
 // copy lives in the user cache directory, keyed by module version and
 // patch content, so builds reuse it (and their build cache stays warm).
 func patchedTailscale() (string, error) {
-	srcDir, err := goList("{{.Dir}}", "tailscale.com")
-	if err != nil {
-		return "", err
-	}
-	version, err := goList("{{.Version}}", "tailscale.com")
+	version, srcDir, err := downloadModule("tailscale.com")
 	if err != nil {
 		return "", err
 	}
@@ -239,9 +248,13 @@ func PacketPathModfile(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	gomod, err := goList("{{.GoMod}}", "github.com/tailscale/tailcat")
+	out, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("go env GOMOD: %w", err)
+	}
+	gomod := strings.TrimSpace(string(out))
+	if gomod == "" || gomod == os.DevNull {
+		return "", fmt.Errorf("go env GOMOD: not in a module")
 	}
 	mod, err := os.ReadFile(gomod)
 	if err != nil {
