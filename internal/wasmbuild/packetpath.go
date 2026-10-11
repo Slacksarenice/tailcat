@@ -78,13 +78,24 @@ var packetPathEdits = []magicsockEdit{
 	},
 }
 
+// goCommand returns a go command, with any extra environment, that
+// resolves modules from the tailcat module alone. A go.work that also
+// held, say, a tailscale.com checkout would otherwise take precedence
+// over both the module cache copy patched here and the -modfile replace
+// that points at it.
+func goCommand(env []string, args ...string) *exec.Cmd {
+	cmd := exec.Command("go", args...)
+	cmd.Env = append(append(os.Environ(), "GOWORK=off"), env...)
+	return cmd
+}
+
 // downloadModule returns the version of module mod that the main module
 // in the current directory requires, and the module cache directory
 // holding it, downloading it first if needed. ("go list -m" would
 // report an empty directory for a module not yet downloaded, as in a
 // fresh clone.)
 func downloadModule(mod string) (version, dir string, err error) {
-	out, err := exec.Command("go", "mod", "download", "-json", mod).Output()
+	out, err := goCommand(nil, "mod", "download", "-json", mod).Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return "", "", fmt.Errorf("go mod download %s: %v\n%s%s", mod, err, out, ee.Stderr)
@@ -259,9 +270,9 @@ func copyWritable(src, dst string) error {
 // tailcat module in the current directory that replaces tailscale.com
 // with a copy carrying the magicsock packet path hook, and returns its
 // path. Build with it via -modfile, together with -tags
-// [PacketPathTag].
+// [PacketPathTag], and with GOWORK=off.
 func PacketPathModfile(dir string) (string, error) {
-	out, err := exec.Command("go", "env", "GOMOD").Output()
+	out, err := goCommand(nil, "env", "GOMOD").Output()
 	if err != nil {
 		return "", fmt.Errorf("go env GOMOD: %w", err)
 	}

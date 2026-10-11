@@ -5,7 +5,6 @@ package wasmbuild
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,9 +64,8 @@ func TestPacketPathModfile(t *testing.T) {
 		{nil, []string{"test", "-count=1", "-tags", PacketPathTag, "-modfile", modfile, "-run", "PacketPath", "."}},
 	} {
 		args := step.args
-		cmd := exec.Command("go", args...)
+		cmd := goCommand(step.env, args...)
 		cmd.Dir = root
-		cmd.Env = append(os.Environ(), step.env...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, out)

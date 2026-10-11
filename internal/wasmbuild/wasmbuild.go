@@ -54,12 +54,11 @@ func Build(pkgDir, outPath string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("go", "build",
+	cmd := goCommand([]string{"GOOS=js", "GOARCH=wasm"}, "build",
 		"-tags", buildtags.WasmTags()+","+PacketPathTag,
 		"-modfile", modfile,
 		"-trimpath",
 		"-ldflags=-s -w", "-o", outPath, pkgDir)
-	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("go build %v: %v\n%s", pkgDir, err, out)
 	}
