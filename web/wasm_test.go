@@ -763,6 +763,58 @@ func TestBrowserToBrowserWebRTC(t *testing.T) {
 	p.checkTransfer()
 }
 
+// TestBrowserCloseDoesNotBlock closes a listener the moment it is up,
+// while its first relay probes are still in flight, and checks that
+// the page keeps running. Waiting for those probes inside the call
+// would hold the event loop they need to end, freezing the page.
+func TestBrowserCloseDoesNotBlock(t *testing.T) {
+	bin := preflight(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	browserCtx := launchChrome(t, bin)
+	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
+	t.Cleanup(cancelRun)
+
+	var ready bool
+	if err := chromedp.Run(runCtx,
+		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
+			chromedp.WithPollingTimeout(60*time.Second)),
+	); err != nil {
+		t.Fatalf("loading the page: %v", err)
+	}
+
+	var got struct {
+		Promises bool `json:"promises"`
+		Ticks    int  `json:"ticks"`
+	}
+	ctx, cancel := context.WithTimeout(runCtx, 30*time.Second)
+	defer cancel()
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(async () => {
+		const l = await tailcatListen({derpMapURL: location.origin + "/derpmap.json", onConnection() {}});
+		let ticks = 0;
+		const iv = setInterval(() => ticks++, 10);
+		const d = l.disconnect("nodekey:0000000000000000000000000000000000000000000000000000000000000000");
+		const c = l.close();
+		const promises = typeof d?.then === "function" && typeof c?.then === "function";
+		await Promise.all([d, c]);
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		clearInterval(iv);
+		return {promises, ticks};
+	})()`, &got, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatalf("closing the listener (a frozen page times out here): %v", err)
+	}
+	if !got.Promises {
+		t.Errorf("disconnect and close returned something other than Promises")
+	}
+	if got.Ticks == 0 {
+		t.Errorf("no timer fired in the 500ms after close")
+	}
+}
+
 // TestBrowserWebRTCListenerOff has a WebRTC-enabled tab dial a tab
 // listening with WebRTC off: the dialer finds no signaling service and
 // the transfer completes over DERP.

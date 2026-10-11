@@ -10,6 +10,13 @@
 // "webrtc" option, the tunnel's traffic moves to a direct WebRTC
 // DataChannel between the browsers whenever one can be opened, and
 // back to DERP if it fails; see webrtc_js.go.
+//
+// A function the page calls runs on the page's event loop, which the
+// call holds until it returns. Anything that can wait on the network
+// therefore runs on a goroutine and hands the page a Promise: closing a
+// node, say, waits for its in-flight fetches and WebSockets to end, and
+// those can only end on the event loop, so waiting for them in the
+// call itself would freeze the page.
 package main
 
 import (
@@ -62,8 +69,10 @@ func main() {
 //	{
 //	  addr: string,           // the "tc..." address to share
 //	  privateKeyJSON: string, // the key (with its DERP region pinned), for persistence
-//	  disconnect: (peerKey, {block: bool}) => bool, // drop a client; block refuses it later
-//	  close: () => {},
+//	  // Drop a client; block refuses it from now on. Resolves to whether
+//	  // it was connected.
+//	  disconnect: (peerKey, {block: bool}) => Promise<bool>,
+//	  close: () => Promise, // resolves once the server has shut down
 //	}
 func tailcatListen(this js.Value, args []js.Value) any {
 	if len(args) != 1 || args[0].Type() != js.TypeObject {
@@ -141,26 +150,32 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			"privateKeyJSON": string(keyOut),
 			"disconnect": js.FuncOf(func(this js.Value, args []js.Value) any {
 				if len(args) < 1 || args[0].Type() != js.TypeString {
-					return false
+					return resolvedPromise(false)
 				}
 				var k key.NodePublic
 				if err := k.UnmarshalText([]byte(args[0].String())); err != nil {
-					return false
+					return resolvedPromise(false)
 				}
+				// The block and the WebRTC session's end take effect
+				// before this returns; neither waits on anything.
 				if len(args) > 1 && args[1].Type() == js.TypeObject && args[1].Get("block").Truthy() {
 					blocked.Add(k)
 				}
 				if rtc != nil {
 					rtc.disconnect(k)
 				}
-				return srv.DisconnectClient(k)
+				return makePromise(func() (any, error) {
+					return srv.DisconnectClient(k), nil
+				})
 			}),
 			"close": js.FuncOf(func(this js.Value, args []js.Value) any {
 				if rtc != nil {
 					rtc.close()
 				}
-				srv.Close()
-				return nil
+				return makePromise(func() (any, error) {
+					srv.Close()
+					return js.Undefined(), nil
+				})
 			}),
 		}, nil
 	})
@@ -269,7 +284,9 @@ func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 //	  read: () => Promise<Uint8Array|null>, // null on EOF; no concurrent calls
 //	  write: (Uint8Array) => Promise,
 //	  closeWrite: () => Promise, // half-close, netcat style
-//	  close: () => {},
+//	  // Resolves once the connection is closed and, for a dialed one,
+//	  // the client that dialed it has shut down.
+//	  close: () => Promise,
 //	}
 //
 // read is pull-based: the browser only reads from netstack when the
@@ -324,11 +341,13 @@ func makeJSConn(c net.Conn, port uint16, peer key.NodePublic, onClose func()) js
 			})
 		}),
 		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
-			c.Close()
-			if onClose != nil {
-				onClose()
-			}
-			return nil
+			return makePromise(func() (any, error) {
+				c.Close()
+				if onClose != nil {
+					onClose()
+				}
+				return js.Undefined(), nil
+			})
 		}),
 	})
 }
@@ -367,6 +386,10 @@ func makePromise(f func() (any, error)) js.Value {
 
 func rejectedPromise(err error) js.Value {
 	return js.Global().Get("Promise").Call("reject", js.Global().Get("Error").New(err.Error()))
+}
+
+func resolvedPromise(v any) js.Value {
+	return js.Global().Get("Promise").Call("resolve", v)
 }
 
 // invokeSafely calls the page's callback f, named name. If it throws,
