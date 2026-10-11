@@ -7,10 +7,18 @@
 // precompressed .zst and .gz variants. Servers such as
 // cmd/tailcat-web and tailcat.dev's tailcatmd serve the result via
 // the webdemo package.
+//
+// With -modfile instead of -o, it writes the go.mod that the wasm build
+// uses, whose tailscale.com carries the magicsock packet path hook,
+// into the given directory and prints its path, for working on the
+// tailcat_webrtc code outside the dist build:
+//
+//	go test -tags tailcat_webrtc -modfile "$(go run ./cmd/tailcat-webdist -modfile /tmp/pp)" -run PacketPath .
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"time"
 
@@ -18,14 +26,23 @@ import (
 )
 
 var (
-	flagOut    = flag.String("o", "", "output directory for the dist files (required)")
-	flagWebDir = flag.String("web-dir", "web", "path to the web/ directory with index.html and app.js")
+	flagOut     = flag.String("o", "", "output directory for the dist files")
+	flagWebDir  = flag.String("web-dir", "web", "path to the web/ directory with index.html and app.js")
+	flagModfile = flag.String("modfile", "", "if set, only write the packet path build's go.mod into this directory and print its path")
 )
 
 func main() {
 	flag.Parse()
+	if *flagModfile != "" {
+		path, err := wasmbuild.PacketPathModfile(*flagModfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(path)
+		return
+	}
 	if *flagOut == "" {
-		log.Fatal("tailcat-webdist: -o output directory is required")
+		log.Fatal("tailcat-webdist: -o output directory (or -modfile) is required")
 	}
 	t0 := time.Now()
 	if err := wasmbuild.Dist(*flagWebDir, *flagOut); err != nil {

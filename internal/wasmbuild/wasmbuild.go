@@ -40,9 +40,23 @@ func WasmExecJS() (string, error) {
 }
 
 // Build compiles the Go package in pkgDir for js/wasm and writes the
-// binary to outPath.
+// binary to outPath. It builds with the magicsock packet path hook
+// (see [PacketPathModfile]) and [PacketPathTag], which the web app's
+// WebRTC support needs.
 func Build(pkgDir, outPath string) error {
-	cmd := exec.Command("go", "build", "-tags", buildtags.WasmTags(), "-ldflags=-s -w", "-o", outPath, pkgDir)
+	modDir, err := os.MkdirTemp("", "tailcat-wasm-modfile")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(modDir)
+	modfile, err := PacketPathModfile(modDir)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("go", "build",
+		"-tags", buildtags.WasmTags()+","+PacketPathTag,
+		"-modfile", modfile,
+		"-ldflags=-s -w", "-o", outPath, pkgDir)
 	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("go build %v: %v\n%s", pkgDir, err, out)
