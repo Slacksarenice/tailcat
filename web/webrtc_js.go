@@ -836,6 +836,18 @@ func (r *rtcServer) waitTurn(peer key.NodePublic) bool {
 	}
 }
 
+// readPreambleLine reads one line of the preamble exchange. A line
+// longer than br's buffer (bufio's default 4 KiB, far more than either
+// preamble line) comes back cut short, to be rejected, rather than read
+// without bound.
+func readPreambleLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		err = nil
+	}
+	return string(line), err
+}
+
 // handleSignal serves one signaling stream from a client.
 func (r *rtcServer) handleSignal(c net.Conn) {
 	peer, ok := r.srv.PeerKey(c.RemoteAddr())
@@ -845,7 +857,7 @@ func (r *rtcServer) handleSignal(c net.Conn) {
 	}
 	c.SetDeadline(time.Now().Add(signalTimeout))
 	br := bufio.NewReader(c)
-	line, err := br.ReadString('\n')
+	line, err := readPreambleLine(br)
 	if err != nil || line != signalPreamble {
 		c.Close()
 		return
@@ -970,7 +982,7 @@ func rtcClientSession(ctx context.Context, cl *tailcat.Client, peer key.NodePubl
 	_, err = io.WriteString(c, signalPreamble)
 	var line string
 	if err == nil {
-		line, err = br.ReadString('\n')
+		line, err = readPreambleLine(br)
 	}
 	if err != nil || line != signalAccept {
 		c.Close()
