@@ -6,7 +6,10 @@
 // tailcatListen and tailcatDial, that app.js uses to implement
 // file sharing. The browser reaches DERP relays over WebSockets,
 // which tailscale.com's derphttp package does automatically under
-// GOOS=js.
+// GOOS=js. When both ends of a tunnel are this app and enable the
+// "webrtc" option, the tunnel's traffic moves to a direct WebRTC
+// DataChannel between the browsers whenever one can be opened, and
+// back to DERP if it fails; see webrtc_js.go.
 package main
 
 import (
@@ -24,6 +27,11 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
+
+// webrtcSignalPort is the TCP port on a web listener's tunnel address
+// where WebRTC signaling is served (see webrtc_js.go). Listeners never
+// hand connections to it to the page, and the page can't dial it.
+const webrtcSignalPort = 65534
 
 func main() {
 	js.Global().Set("tailcatListen", js.FuncOf(tailcatListen))
@@ -43,6 +51,10 @@ func main() {
 //	  privateKey: string,      // optional tailcat.PrivateKey JSON; ephemeral if empty
 //	  verbose: bool,           // optional; log to the console
 //	  onConnection: (conn) => {}, // called with a conn object per incoming connection
+//	  webrtc: bool | {iceServers: [...]}, // optional; answer WebRTC upgrades from
+//	                           // web clients that enable it. iceServers defaults to
+//	                           // the DERP region's STUN servers.
+//	  onPathChange: ({peerKey, path}) => {}, // optional; path is "webrtc" or "derp"
 //	}
 //
 // It returns a Promise that resolves to:
@@ -50,6 +62,7 @@ func main() {
 //	{
 //	  addr: string,           // the "tc..." address to share
 //	  privateKeyJSON: string, // the key (with its DERP region pinned), for persistence
+//	  disconnect: (peerKey, {block: bool}) => bool, // drop a client; block refuses it later
 //	  close: () => {},
 //	}
 func tailcatListen(this js.Value, args []js.Value) any {
@@ -102,11 +115,21 @@ func tailcatListen(this js.Value, args []js.Value) any {
 		}
 
 		srv := &tailcat.Server{Key: pk.Private, PresharedKey: pk.Public.PresharedKey, Logf: logf, Region: reg}
+		var blocked tailcat.KeySet
+		srv.AllowClient = func(k key.NodePublic) bool { return !blocked.Contains(k) }
+		rtc := newRTCServer(srv, opts, reg, logf)
 		srv.OnTCP = func(port uint16) (handler func(net.Conn)) {
+			if port == webrtcSignalPort {
+				if rtc == nil {
+					return nil // reset: WebRTC is off
+				}
+				return rtc.handleSignal
+			}
 			// Like the CLI's default mode, accept a connection on
 			// any port and hand it to the page.
 			return func(c net.Conn) {
-				onConnection.Invoke(makeJSConn(c, port, nil))
+				peer, _ := srv.PeerKey(c.RemoteAddr())
+				invokeSafely("onConnection", onConnection, makeJSConn(c, port, peer, nil))
 			}
 		}
 		if err := srv.Start(); err != nil {
@@ -116,7 +139,26 @@ func tailcatListen(this js.Value, args []js.Value) any {
 		return map[string]any{
 			"addr":           string(addr),
 			"privateKeyJSON": string(keyOut),
+			"disconnect": js.FuncOf(func(this js.Value, args []js.Value) any {
+				if len(args) < 1 || args[0].Type() != js.TypeString {
+					return false
+				}
+				var k key.NodePublic
+				if err := k.UnmarshalText([]byte(args[0].String())); err != nil {
+					return false
+				}
+				if len(args) > 1 && args[1].Type() == js.TypeObject && args[1].Get("block").Truthy() {
+					blocked.Add(k)
+				}
+				if rtc != nil {
+					rtc.disconnect(k)
+				}
+				return srv.DisconnectClient(k)
+			}),
 			"close": js.FuncOf(func(this js.Value, args []js.Value) any {
+				if rtc != nil {
+					rtc.close()
+				}
 				srv.Close()
 				return nil
 			}),
@@ -135,9 +177,15 @@ func tailcatListen(this js.Value, args []js.Value) any {
 //	  privateKey: string, // optional tailcat.PrivateKey JSON; ephemeral if empty
 //	  port: number,       // optional TCP port; defaults to 1 like the CLI
 //	  verbose: bool,
+//	  webrtc: bool | {iceServers: [...]}, // optional; upgrade to a direct WebRTC path
+//	                      // if the server is this web app with WebRTC enabled.
+//	                      // Leave it off for native tailcat servers.
+//	  onPathChange: ({peerKey, path}) => {}, // optional; path is "webrtc" or "derp"
 //	}
 //
-// It returns a Promise that resolves to a conn object (see makeJSConn).
+// It returns a Promise that resolves to a conn object (see makeJSConn)
+// as soon as the stream is open over DERP; a WebRTC upgrade, if
+// enabled, happens in the background, under the open stream.
 func tailcatDial(this js.Value, args []js.Value) any {
 	if len(args) != 1 || args[0].Type() != js.TypeObject {
 		return rejectedPromise(errors.New("tailcatDial requires an options object"))
@@ -154,6 +202,9 @@ func tailcatDial(this js.Value, args []js.Value) any {
 	return makePromise(func() (any, error) {
 		if addr == "" {
 			return nil, errors.New("addr is required")
+		}
+		if port == webrtcSignalPort {
+			return nil, fmt.Errorf("port %d is reserved for WebRTC signaling", port)
 		}
 		priv := key.NewNode()
 		if keyJSON != "" {
@@ -180,7 +231,16 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			cl.Close()
 			return nil, fmt.Errorf("DialTCPPort: %w", err)
 		}
-		return makeJSConn(c, port, func() { cl.Close() }), nil
+		var serverKey key.NodePublic
+		if ci, err := tailcat.ParseAddr(tailcat.Addr(addr)); err == nil {
+			serverKey = ci.ServerPublic.NodePublic
+		}
+		rtcCtx, stopRTC := context.WithCancel(context.Background())
+		go runRTCClient(rtcCtx, cl, opts, logf)
+		return makeJSConn(c, port, serverKey, func() {
+			stopRTC()
+			cl.Close()
+		}), nil
 	})
 }
 
@@ -205,6 +265,7 @@ func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 //
 //	{
 //	  port: number,
+//	  peerKey: string, // the other end's node key ("nodekey:..."), authenticated by the tunnel
 //	  read: () => Promise<Uint8Array|null>, // null on EOF; no concurrent calls
 //	  write: (Uint8Array) => Promise,
 //	  closeWrite: () => Promise, // half-close, netcat style
@@ -214,10 +275,15 @@ func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 // read is pull-based: the browser only reads from netstack when the
 // page asks for more, so a fast sender stalls on TCP backpressure
 // rather than filling browser memory.
-func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
+func makeJSConn(c net.Conn, port uint16, peer key.NodePublic, onClose func()) js.Value {
 	buf := make([]byte, 64<<10)
+	peerKey := ""
+	if !peer.IsZero() {
+		peerKey = peer.String()
+	}
 	return js.ValueOf(map[string]any{
-		"port": int(port),
+		"port":    int(port),
+		"peerKey": peerKey,
 		"read": js.FuncOf(func(this js.Value, args []js.Value) any {
 			return makePromise(func() (any, error) {
 				n, err := c.Read(buf)
@@ -301,4 +367,16 @@ func makePromise(f func() (any, error)) js.Value {
 
 func rejectedPromise(err error) js.Value {
 	return js.Global().Get("Promise").Call("reject", js.Global().Get("Error").New(err.Error()))
+}
+
+// invokeSafely calls the page's callback f, named name. If it throws,
+// the error is logged: left to panic, it would end the program and
+// every tunnel in it.
+func invokeSafely(name string, f js.Value, args ...any) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("tailcat: %s threw: %v", name, r)
+		}
+	}()
+	f.Invoke(args...)
 }
