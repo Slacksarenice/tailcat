@@ -3,9 +3,9 @@
 
 //go:build tailcat_webrtc
 
-// These tests need the magicsock packet path overlay; run them with
-// the go test invocation that internal/wasmbuild's
-// TestPacketPathOverlay prints, or via that test itself.
+// These tests need tailscale.com with the magicsock packet path patch;
+// run them with the go test invocation that internal/wasmbuild's
+// TestPacketPathModfile logs, or via that test itself.
 
 package tailcat
 
@@ -30,6 +30,7 @@ type memPath struct {
 	toServer, toClient chan []byte
 	server, client     atomic.Pointer[PacketPath]
 	carried            atomic.Int64 // datagram bytes taken by either side's send
+	carriedToServer    atomic.Int64 // of which the client sent
 	accept             atomic.Bool  // whether send takes datagrams
 	done               chan struct{}
 	wg                 sync.WaitGroup
@@ -76,6 +77,9 @@ func (m *memPath) sendTo(ch chan []byte) func([]byte) bool {
 		default: // full: drop, like a UDP socket
 		}
 		m.carried.Add(int64(len(pkt)))
+		if ch == m.toServer {
+			m.carriedToServer.Add(int64(len(pkt)))
+		}
 		return true
 	}
 }
@@ -158,9 +162,14 @@ func TestPacketPathCarriesTraffic(t *testing.T) {
 	}
 	// Every WireGuard data datagram carries its plaintext plus
 	// overhead, so a path that carried the transfer moved more bytes
-	// than the payload itself.
-	if got := m.carried.Load(); got < size {
-		t.Fatalf("packet path carried %d bytes of a %d-byte transfer", got, size)
+	// than the payload itself from the server; the client's TCP
+	// acknowledgements went the other way.
+	up := m.carriedToServer.Load()
+	if down := m.carried.Load() - up; down < size {
+		t.Fatalf("packet path carried %d bytes of a %d-byte transfer to the client", down, size)
+	}
+	if up == 0 {
+		t.Fatal("packet path carried nothing from the client to the server")
 	}
 }
 

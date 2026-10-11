@@ -40,6 +40,15 @@ func TestPacketPathModfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The replace path ends up in the binary's build information, so it
+	// must not name the build machine's directories.
+	mod, err := os.ReadFile(modfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `replace tailscale.com => "./` + patchDir + `/`; !strings.Contains(string(mod), want) {
+		t.Errorf("modfile has no relative replace %q:\n%s", want, mod)
+	}
 	if testing.Short() {
 		t.Skip("skipping the patched build and packet path tests in -short mode")
 	}

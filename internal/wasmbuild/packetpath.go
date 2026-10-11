@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // PacketPathTag is the build tag that compiles tailcat's packet path
@@ -134,25 +136,32 @@ func patchHash() string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-// patchedTailscale returns a directory holding a copy of the
-// tailscale.com module that tailcat requires, with the magicsock
-// packet path patch applied. The go command forbids overlaying files
-// in the module cache, so the patch is applied to a copy instead. The
-// copy lives in the user cache directory, keyed by module version and
-// patch content, so builds reuse it (and their build cache stays warm).
-func patchedTailscale() (string, error) {
+// patchDir is where, under the tailcat module's root, the patched
+// tailscale.com copies live. The go command skips directories whose
+// names begin with a dot, so ./... never includes them; .gitignore
+// lists it.
+const patchDir = ".wasmbuild"
+
+// patchedTailscale returns the path, relative to the module root
+// modRoot, of a copy of the tailscale.com module that tailcat requires
+// with the magicsock packet path patch applied. The go command forbids
+// overlaying files in the module cache, so the patch is applied to a
+// copy instead. The copy is keyed by module version and patch content,
+// so builds reuse it (and their build cache stays warm). It lives
+// inside the module so the replace directive can name it relatively:
+// the binary's build information records that path, and an absolute
+// one would name the build machine's directories even under -trimpath.
+func patchedTailscale(modRoot string) (string, error) {
 	version, srcDir, err := downloadModule("tailscale.com")
 	if err != nil {
 		return "", err
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	parent := filepath.Join(cache, "tailcat-wasmbuild")
-	dst := filepath.Join(parent, "tailscale.com@"+version+"-pp"+patchHash())
+	parent := filepath.Join(modRoot, patchDir)
+	name := "tailscale.com@" + version + "-pp" + patchHash()
+	rel := "./" + patchDir + "/" + name
+	dst := filepath.Join(parent, name)
 	if _, err := os.Stat(filepath.Join(dst, "go.mod")); err == nil {
-		return dst, nil
+		return rel, nil
 	}
 	if err := os.MkdirAll(parent, 0755); err != nil {
 		return "", err
@@ -185,13 +194,21 @@ func patchedTailscale() (string, error) {
 	if err := os.WriteFile(filepath.Join(msDir, "packetpath.go"), packetPathSource, 0644); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		if _, statErr := os.Stat(filepath.Join(dst, "go.mod")); statErr == nil {
-			return dst, nil // a concurrent build won the race
+	// On Windows a rename can fail for a moment while something (an
+	// antivirus scanner, an indexer) still holds a file just written.
+	for attempt := 1; ; attempt++ {
+		err := os.Rename(tmp, dst)
+		if err == nil {
+			return rel, nil
 		}
-		return "", err
+		if _, statErr := os.Stat(filepath.Join(dst, "go.mod")); statErr == nil {
+			return rel, nil // a concurrent build won the race
+		}
+		if attempt == 5 {
+			return "", err
+		}
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
-	return dst, nil
 }
 
 // copyModule copies the module source tree in src to dst, which must
@@ -244,10 +261,6 @@ func copyWritable(src, dst string) error {
 // path. Build with it via -modfile, together with -tags
 // [PacketPathTag].
 func PacketPathModfile(dir string) (string, error) {
-	tsDir, err := patchedTailscale()
-	if err != nil {
-		return "", err
-	}
 	out, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
 		return "", fmt.Errorf("go env GOMOD: %w", err)
@@ -255,6 +268,12 @@ func PacketPathModfile(dir string) (string, error) {
 	gomod := strings.TrimSpace(string(out))
 	if gomod == "" || gomod == os.DevNull {
 		return "", fmt.Errorf("go env GOMOD: not in a module")
+	}
+	// Relative replace paths resolve against the main module's root,
+	// whichever file -modfile names.
+	tsDir, err := patchedTailscale(filepath.Dir(gomod))
+	if err != nil {
+		return "", err
 	}
 	mod, err := os.ReadFile(gomod)
 	if err != nil {
@@ -267,8 +286,7 @@ func PacketPathModfile(dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	// go.mod paths use forward slashes on every platform.
-	mod = fmt.Appendf(mod, "\n// Added by internal/wasmbuild: tailscale.com with the magicsock packet path hook.\nreplace tailscale.com => %s\n", filepath.ToSlash(tsDir))
+	mod = fmt.Appendf(mod, "\n// Added by internal/wasmbuild: tailscale.com with the magicsock packet path hook.\nreplace tailscale.com => %s\n", strconv.Quote(tsDir))
 	modfile := filepath.Join(dir, "tailcat-packetpath.mod")
 	if err := os.WriteFile(modfile, mod, 0644); err != nil {
 		return "", err

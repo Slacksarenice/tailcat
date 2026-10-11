@@ -13,7 +13,7 @@ import (
 )
 
 // This file is compiled only with the tailcat_webrtc build tag, which
-// requires building with the magicsock overlay that adds
+// requires building with the patched tailscale.com whose magicsock adds
 // magicsock.PacketPath; see internal/wasmbuild. tailcat's browser
 // build uses it to carry WireGuard traffic over WebRTC.
 
