@@ -14,3 +14,7 @@
 
 # libtailcat build output (see cmd/libtailcat/README.md).
 /build
+
+# Patched tailscale.com copies for the web app's wasm build (see
+# internal/wasmbuild/packetpath.go).
+/.wasmbuild

@@ -1,0 +1,180 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+// This file is not part of tailscale.com. The tailcat repository keeps
+// it in internal/wasmbuild/magicsockpatch, and its wasm build adds it
+// to a copy of tailscale.com/wgengine/magicsock, together with small
+// edits to magicsock.go and endpoint.go that call into it; see
+// internal/wasmbuild/packetpath.go there.
+
+package magicsock
+
+import (
+	"net"
+	"sync"
+	"sync/atomic"
+
+	"github.com/tailscale/wireguard-go/conn"
+	"tailscale.com/types/key"
+)
+
+// packetPathQueueLen bounds the datagrams received over packet paths
+// that are waiting for WireGuard to read them, like a UDP socket's
+// receive buffer. A full queue drops, and inner TCP retransmits.
+const packetPathQueueLen = 256
+
+// packetPathMaxLen is the largest datagram a packet path delivers.
+const packetPathMaxLen = 65535
+
+// packetPathState is a Conn's set of embedder-supplied packet paths.
+// Its zero value is ready to use.
+type packetPathState struct {
+	mu    sync.Mutex
+	paths map[key.NodePublic]*PacketPath
+
+	recvOnce sync.Once
+	recv     chan packetPathRead
+}
+
+func (s *packetPathState) recvCh() chan packetPathRead {
+	s.recvOnce.Do(func() {
+		s.recv = make(chan packetPathRead, packetPathQueueLen)
+	})
+	return s.recv
+}
+
+func (s *packetPathState) current(peer key.NodePublic) *PacketPath {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paths[peer]
+}
+
+// packetPathRead is a datagram received over a packet path. A zero
+// value is the wake-up that connBind.Close sends.
+type packetPathRead struct {
+	path *PacketPath
+	pkt  []byte
+}
+
+// PacketPath is an alternate transport, supplied by the program
+// embedding magicsock, for one peer's WireGuard datagrams. tailcat's
+// browser build uses it to carry them over a WebRTC DataChannel, which
+// browsers can open peer to peer when they can't open UDP sockets.
+//
+// While a PacketPath is installed for a peer, every datagram WireGuard
+// sends to that peer is offered to it first; whatever it declines takes
+// the ordinary UDP or DERP path. The datagrams are already encrypted,
+// and WireGuard authenticates each one it receives, so a packet path
+// adds neither confidentiality nor trust: a datagram forged or
+// corrupted in transit is discarded like one arriving over DERP.
+type PacketPath struct {
+	c      *Conn
+	peer   key.NodePublic
+	send   func([]byte) bool
+	closed atomic.Bool
+}
+
+// NewPacketPath installs a packet path for peer, replacing any
+// previous one, which stops carrying traffic.
+//
+// send is called with each datagram WireGuard sends to peer. It must
+// not block, and must copy the datagram if it keeps it after
+// returning. It reports whether it took the datagram: true even if it
+// then dropped it, as a full UDP socket would; false to have this
+// datagram and the rest of its batch use the ordinary path.
+func (c *Conn) NewPacketPath(peer key.NodePublic, send func(pkt []byte) bool) *PacketPath {
+	p := &PacketPath{c: c, peer: peer, send: send}
+	s := &c.packetPaths
+	s.mu.Lock()
+	if s.paths == nil {
+		s.paths = make(map[key.NodePublic]*PacketPath)
+	}
+	if old := s.paths[peer]; old != nil {
+		old.closed.Store(true)
+	}
+	s.paths[peer] = p
+	s.mu.Unlock()
+	return p
+}
+
+// Peer returns the node key of the peer that p carries traffic for.
+func (p *PacketPath) Peer() key.NodePublic { return p.peer }
+
+// Close uninstalls p, returning the peer's traffic to the ordinary
+// path. Closing a path that a later NewPacketPath call replaced does
+// not affect its replacement. Close is idempotent.
+func (p *PacketPath) Close() {
+	p.closed.Store(true)
+	s := &p.c.packetPaths
+	s.mu.Lock()
+	if s.paths[p.peer] == p {
+		delete(s.paths, p.peer)
+	}
+	s.mu.Unlock()
+}
+
+// Deliver hands WireGuard a datagram received from the peer over p,
+// copying it. It reports whether the datagram was queued; it is
+// dropped if p is closed or replaced, if the datagram is empty or too
+// large, or if too many received datagrams are already waiting.
+func (p *PacketPath) Deliver(pkt []byte) bool {
+	if len(pkt) == 0 || len(pkt) > packetPathMaxLen || p.closed.Load() || p.c.closing.Load() {
+		return false
+	}
+	select {
+	case p.c.packetPaths.recvCh() <- packetPathRead{path: p, pkt: append([]byte(nil), pkt...)}:
+		return true
+	default:
+		return false
+	}
+}
+
+// sendPacketPath offers buffs (each starting at offset) to peer's
+// packet path, if any, and returns how many of them it took. The rest
+// take the ordinary path.
+func (c *Conn) sendPacketPath(peer key.NodePublic, buffs [][]byte, offset int) int {
+	p := c.packetPaths.current(peer)
+	if p == nil {
+		return 0
+	}
+	for i, b := range buffs {
+		if p.closed.Load() || !p.send(b[offset:]) {
+			return i
+		}
+	}
+	return len(buffs)
+}
+
+// receivePacketPath is the conn.ReceiveFunc that hands WireGuard the
+// datagrams delivered over packet paths.
+func (c *connBind) receivePacketPath(slab []byte, packets []conn.ReceivedPacket) (int, error) {
+	for r := range c.packetPaths.recvCh() {
+		if c.isClosed() {
+			break
+		}
+		if r.path == nil || r.path.closed.Load() || len(r.pkt) > len(slab) {
+			continue
+		}
+		c.Conn.mu.Lock() // not connBind.mu, which guards only closed
+		ep, ok := c.peerMap.endpointForNodeKey(r.path.peer)
+		c.Conn.mu.Unlock()
+		if !ok {
+			continue
+		}
+		packets[0].Size = copy(slab, r.pkt)
+		packets[0].Offset = 0
+		packets[0].Endpoint = ep
+		return 1, nil
+	}
+	return 0, net.ErrClosed
+}
+
+// wakePacketPathRecv unblocks a receivePacketPath call waiting for a
+// datagram, so it notices that the bind closed. A full queue needs no
+// wake-up: the reader checks for closure before each datagram.
+func (c *Conn) wakePacketPathRecv() {
+	select {
+	case c.packetPaths.recvCh() <- packetPathRead{}:
+	default:
+	}
+}
