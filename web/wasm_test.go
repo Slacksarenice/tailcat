@@ -815,6 +815,73 @@ func TestBrowserCloseDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestBrowserDialBadAddrDoesNotBlock dials two addresses no client can
+// use and checks that the page keeps running. One doesn't parse, and is
+// refused at once. The other, a legacy address, parses, but its client
+// fails to start on every attempt, without blocking: retrying that with
+// no pause would hold the page's thread until the dial timed out.
+func TestBrowserDialBadAddrDoesNotBlock(t *testing.T) {
+	bin := preflight(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	browserCtx := launchChrome(t, bin)
+	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
+	t.Cleanup(cancelRun)
+
+	var ready bool
+	if err := chromedp.Run(runCtx,
+		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
+			chromedp.WithPollingTimeout(60*time.Second)),
+	); err != nil {
+		t.Fatalf("loading the page: %v", err)
+	}
+
+	legacy := (&tailcat.ConnInfo{
+		ServerPublic: tailcat.NodePublic{NodePublic: key.NewNode().Public()},
+		RegionID:     1,
+	}).Addr()
+	var got struct {
+		Malformed   string  `json:"malformed"`
+		MalformedMs float64 `json:"malformedMs"`
+		Ticks       int     `json:"ticks"`
+	}
+	ctx, cancel := context.WithTimeout(runCtx, 30*time.Second)
+	defer cancel()
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(async () => {
+		const derpMapURL = location.origin + "/derpmap.json";
+		const t0 = performance.now();
+		let malformed = "resolved";
+		try {
+			await tailcatDial({addr: "tc" + "A".repeat(40), derpMapURL});
+		} catch (e) {
+			malformed = String(e);
+		}
+		const malformedMs = performance.now() - t0;
+		let ticks = 0;
+		const iv = setInterval(() => ticks++, 10);
+		tailcatDial({addr: `+strconv.Quote(string(legacy))+`, derpMapURL}).catch(() => {});
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		clearInterval(iv);
+		return {malformed, malformedMs, ticks};
+	})()`, &got, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatalf("dialing (a frozen page times out here): %v", err)
+	}
+	if !strings.Contains(got.Malformed, "invalid addr") {
+		t.Errorf("dialing a malformed address: %q; want an invalid addr error", got.Malformed)
+	}
+	if got.MalformedMs > 5000 {
+		t.Errorf("dialing a malformed address took %.0fms to fail; want it refused at once", got.MalformedMs)
+	}
+	// 200 if the 10ms timer ran on time throughout.
+	if got.Ticks < 50 {
+		t.Errorf("timers fired %d times in the 2s after dialing a legacy address; want the page to keep running", got.Ticks)
+	}
+}
+
 // TestBrowserWebRTCListenerOff has a WebRTC-enabled tab dial a tab
 // listening with WebRTC off: the dialer finds no signaling service and
 // the transfer completes over DERP.
