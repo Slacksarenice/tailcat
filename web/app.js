@@ -212,6 +212,10 @@ function onConnection(conn) {
     hashSink(conn);
     return;
   }
+  if (params.get("sink") === "count") {
+    countSink(conn);
+    return;
+  }
   const li = document.createElement("li");
   const btn = document.createElement("button");
   btn.textContent = "Save incoming file…";
@@ -309,6 +313,72 @@ async function hashSink(conn) {
   conn.close();
 }
 
+// countSink is the stress tests' receiver: it keeps nothing, so a
+// transfer of any size fits, and checks each byte against the sender's
+// pattern (see patternChunk) as it arrives.
+async function countSink(conn) {
+  let n = 0;
+  let bad = 0;
+  for (let chunk; (chunk = await conn.read()) !== null; ) {
+    for (let i = 0; i < chunk.length; i += 4093) {
+      if (chunk[i] !== patternByte(n + i)) {
+        bad++;
+      }
+    }
+    n += chunk.length;
+    window.tcTest.recvBytes = n;
+  }
+  window.tcTest.recvBad = bad;
+  window.tcTest.recvDone = true;
+  conn.close();
+}
+
+// patternByte is the byte at offset off of a ?pattern transfer.
+function patternByte(off) {
+  return (off * 2654435761 >>> 24) & 0xff;
+}
+
+// patternChunk returns n bytes of the pattern starting at off.
+function patternChunk(off, n) {
+  const b = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    b[i] = patternByte(off + i);
+  }
+  return b;
+}
+
+// With ?timeline, the page records once a second how far the transfer
+// has got, where the traffic goes, and how late its own timers fire:
+// a late timer means the page's thread was busy.
+if (params.has("timeline")) {
+  window.tcTest.timeline = [];
+  window.tcTest.maxLagMs = 0;
+  const t0 = performance.now();
+  let last = t0;
+  let lag = 0;
+  setInterval(() => {
+    const now = performance.now();
+    lag = Math.max(lag, now - last - 100);
+    last = now;
+  }, 100);
+  setInterval(() => {
+    const s = window.tcTest.stats || {};
+    window.tcTest.maxLagMs = Math.max(window.tcTest.maxLagMs, lag);
+    window.tcTest.timeline.push({
+      t: Math.round((performance.now() - t0) / 100) / 10,
+      sent: window.tcTest.sentBytes,
+      recv: window.tcTest.recvBytes,
+      path: window.tcTest.path,
+      rtt: Math.round(s.rttMs || 0),
+      dropped: s.dropped || 0,
+      recvDropped: s.recvDropped || 0,
+      lagMs: Math.round(lag),
+      heapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : 0,
+    });
+    lag = 0;
+  }, 1000);
+}
+
 $("listen-btn").onclick = startListener;
 $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").textContent);
 
@@ -340,6 +410,7 @@ async function sendStream(addr, size, readChunk, progressEl) {
     const chunk = await readChunk(off, Math.min(CHUNK, size - off));
     await conn.write(chunk);
     off += chunk.length;
+    window.tcTest.sentBytes = off;
     progressEl.textContent = `${off} / ${size} bytes`;
   }
   await conn.closeWrite();
@@ -402,14 +473,22 @@ if (params.get("mode") === "listen") {
 } else if (params.get("mode") === "send") {
   const addr = params.get("addr");
   const size = parseInt(params.get("bytes"), 10);
-  const data = new Uint8Array(size);
-  // crypto.getRandomValues caps each call at 64 KiB.
-  for (let off = 0; off < size; off += CHUNK) {
-    crypto.getRandomValues(data.subarray(off, Math.min(off + CHUNK, size)));
+  let readChunk;
+  if (params.has("pattern")) {
+    // A stress test's transfer, too large to hold: generated as it
+    // goes, and checked by countSink.
+    readChunk = async (off, n) => patternChunk(off, n);
+  } else {
+    const data = new Uint8Array(size);
+    // crypto.getRandomValues caps each call at 64 KiB.
+    for (let off = 0; off < size; off += CHUNK) {
+      crypto.getRandomValues(data.subarray(off, Math.min(off + CHUNK, size)));
+    }
+    window.tcTest.sentSha256 = await sha256Hex(data);
+    readChunk = async (off, n) => data.subarray(off, off + n);
   }
-  window.tcTest.sentSha256 = await sha256Hex(data);
   try {
-    await sendStream(addr, size, async (off, n) => data.subarray(off, off + n), $("send-progress"));
+    await sendStream(addr, size, readChunk, $("send-progress"));
   } catch (err) {
     window.tcTest.errors.push(String(err));
   }
