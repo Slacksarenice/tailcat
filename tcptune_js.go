@@ -25,10 +25,29 @@ import (
 // timer is only the last resort.
 const browserMinRTO = time.Second
 
+// browserMaxWindow caps the send and receive buffers of the tunnel's TCP
+// connections in a browser, and so what one can have in flight, below
+// tailscale's 6 MiB (send) and 8 MiB (receive). A browser's paths queue
+// whatever TCP gives them: a WebSocket to DERP has no backpressure, and
+// the hop behind it is itself TCP, so it never drops for the tunnel's
+// TCP to slow down. Its window grew until the WebSocket held seconds of
+// data: a round trip over DERP read 1.4 s, and after a loss, 10 s, with
+// a 33 s timeout. 2 MiB still covers what a browser can move (about
+// 13 MB/s, on its one thread) out to a 150 ms round trip.
+const browserMaxWindow = 2 << 20
+
 // tuneTCP adjusts ns's TCP for the browser.
 func tuneTCP(logf logger.Logf, ns *netstack.Impl) {
 	opt := tcpip.TCPMinRTOOption(browserMinRTO)
 	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
 		logf("tailcat: setting TCP's minimum RTO: %v", err)
+	}
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: browserMaxWindow}
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
+		logf("tailcat: setting TCP's send buffer sizes: %v", err)
+	}
+	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: browserMaxWindow}
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
+		logf("tailcat: setting TCP's receive buffer sizes: %v", err)
 	}
 }
