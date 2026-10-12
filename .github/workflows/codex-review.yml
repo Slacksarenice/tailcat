@@ -10,7 +10,11 @@ run-name: "${{ (inputs.pr || github.event.pull_request.number) && format('Codex 
 # the script in the "Post the review" step.
 #
 # It runs on a GitHub-hosted runner: a fresh VM for each job, discarded after
-# it, so the only credentials on its disk are this job's own.
+# it, so the only credentials on its disk are this job's own. The image is
+# pinned (ubuntu-24.04, not ubuntu-latest) because the Codex sandbox depends
+# on its AppArmor setup ("Allow the Codex sandbox" below): move it to a newer
+# image on purpose, and check that a dispatched run passes "Check the Codex
+# sandbox" there.
 #
 # Everything the job runs travels inside this one file: the prompt, the output
 # schema and the scripts are heredocs in the steps that use them, and nothing
@@ -100,6 +104,19 @@ run-name: "${{ (inputs.pr || github.event.pull_request.number) && format('Codex 
 #        gh secret set CODEX_AUTH_WRITER_TOKEN --env codex --repo Slacksarenice/tailcat
 #   4. gh variable set CODEX_ENABLED -b true --repo Slacksarenice/tailcat
 #      and any other settings (above) as variables.
+#   5. A repository Actions policy that lets this workflow, and only this
+#      one, take pull_request_target: from November 2, 2026, GitHub blocks the
+#      event in public repositories that have no policy allowing it. The
+#      policy allows this workflow's three events and nothing else (shown in
+#      Settings > Actions > Policies):
+#        gh api -X POST repos/Slacksarenice/tailcat/actions/policies --input - <<'EOF'
+#        {"name": "Codex review: allow pull_request_target", "enforcement": "active",
+#         "conditions": {"workflow_path": {"include": [".github/workflows/codex-review.yml"], "exclude": []}},
+#         "rules": [{"type": "restrict_action_events",
+#                    "parameters": {"allowed_events": ["pull_request_target", "workflow_dispatch", "schedule"]}}]}
+#        EOF
+#      A trigger added to this file needs adding to the policy too, or its
+#      runs are blocked.
 # Reseed (step 2) after persistent 401s, a revoked or expired refresh token,
 # or a failed write-back (the job's last step fails and says so).
 #
@@ -169,7 +186,8 @@ jobs:
         (github.event.action != 'edited' || github.event.changes.base.ref.from) &&
         github.event.pull_request.draft == false &&
         github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: ubuntu-latest
+    # Pinned: the sandbox depends on the image (see the top of this file).
+    runs-on: ubuntu-24.04
     # A high-effort review of a large diff takes a while. A job timeout
     # cancels every remaining step, the write-back included, while a step
     # timeout fails only its step and the always() write-back still runs. So
