@@ -57,6 +57,32 @@ func (c *Client) NewPacketPath(send func(pkt []byte) bool) (*PacketPath, error) 
 	return lb.sys.MagicSock.Get().NewPacketPath(lb.serverPub, send), nil
 }
 
+// NetworkChanged tells the server that the host's network may have
+// changed, for platforms with no network monitor that would notice
+// (a browser): it checks its DERP connections and replaces any the
+// change left dead, as tailscaled does after a link change. See
+// [magicsock.Conn.CheckDERPConns]. It does nothing on a Server that
+// isn't started.
+func (s *Server) NetworkChanged() {
+	s.startMu.Lock()
+	lb := s.lb
+	s.startMu.Unlock()
+	if lb != nil {
+		lb.sys.MagicSock.Get().CheckDERPConns()
+	}
+}
+
+// NetworkChanged is [Server.NetworkChanged] for a client. It does
+// nothing on a Client that isn't connected.
+func (c *Client) NetworkChanged() {
+	c.startMu.Lock()
+	lb, started := c.lb, c.started
+	c.startMu.Unlock()
+	if started {
+		lb.sys.MagicSock.Get().CheckDERPConns()
+	}
+}
+
 // ServerPublicKey returns the node key of the server the client
 // connects to, which identifies it as the peer of the client's
 // packet path.

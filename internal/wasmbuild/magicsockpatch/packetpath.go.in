@@ -10,9 +10,11 @@
 package magicsock
 
 import (
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/types/key"
@@ -176,5 +178,38 @@ func (c *Conn) wakePacketPathRecv() {
 	select {
 	case c.packetPaths.recvCh() <- packetPathRead{}:
 	default:
+	}
+}
+
+// derpCheckTimeout is how long CheckDERPConns waits for each DERP
+// connection to answer a ping, as long as a rebind's check waits.
+const derpCheckTimeout = 3 * time.Second
+
+// CheckDERPConns pings each DERP connection and closes any that doesn't
+// answer within derpCheckTimeout, reconnecting it if it is the home
+// region's, as a rebind does for the connections it keeps. An embedder
+// on a platform with no network monitor (a browser) calls it when it
+// learns that the network may have changed, so that a connection the
+// change left dead is replaced at once rather than when it times out,
+// and a live one is left alone.
+func (c *Conn) CheckDERPConns() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for regionID, ad := range c.activeDerp {
+		dc := ad.c
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), derpCheckTimeout)
+			defer cancel()
+			if err := dc.Ping(ctx); err == nil {
+				return
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			// Leave a connection that has already been replaced alone.
+			if cur, ok := c.activeDerp[regionID]; ok && cur.c == dc {
+				c.closeOrReconnectDERPLocked(regionID, "check-ping-fail")
+				c.logActiveDerpLocked()
+			}
+		}()
 	}
 }
