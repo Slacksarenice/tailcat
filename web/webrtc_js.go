@@ -62,6 +62,7 @@ import (
 
 	"github.com/tailscale/tailcat"
 	"github.com/tailscale/tailcat/internal/rtcpolicy"
+	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -94,11 +95,6 @@ const (
 	framePong      = 4 // u32 sequence of the ping received
 	frameHeaderLen = 1
 
-	// probeSize is the size of the qualification probes: larger than
-	// any WireGuard datagram for the tunnel's 1280-byte MTU (1280 plus
-	// 32 bytes of WireGuard overhead), so a path that drops large
-	// messages never qualifies.
-	probeSize     = 1400
 	probesNeeded  = 2
 	probeInterval = 250 * time.Millisecond
 	probeTimeout  = 10 * time.Second
@@ -177,6 +173,12 @@ var (
 	jsArrayBuffer = js.Global().Get("ArrayBuffer")
 	jsUint8Array  = js.Global().Get("Uint8Array")
 )
+
+// probeSize is the size of the qualification probes: larger than any
+// WireGuard datagram for the tunnel's MTU (the MTU plus 32 bytes of
+// WireGuard overhead; the wire MTU adds IP and UDP headers besides), so
+// a path that drops large messages never qualifies.
+func probeSize() int { return frameHeaderLen + int(tstun.DefaultWireMTU()) }
 
 // rtcOptions is the parsed "webrtc" option of tailcatListen and
 // tailcatDial: false/absent, true, or {iceServers: [...]}.
@@ -990,7 +992,7 @@ func (s *rtcSession) qualify() {
 			s.close()
 			return
 		}
-		s.sendControl(frameProbe, seq, probeSize)
+		s.sendControl(frameProbe, seq, probeSize())
 		select {
 		case <-s.ctx.Done():
 			return
@@ -1042,7 +1044,7 @@ func (s *rtcSession) reportStats() {
 	if s.stats == nil {
 		return
 	}
-	local, remote, proto := s.candidatePair()
+	local, remote, proto, iceRTT := s.candidatePair()
 	s.mu.Lock()
 	path := "derp"
 	if s.qualified && !s.live.Suspect() {
@@ -1060,6 +1062,9 @@ func (s *rtcSession) reportStats() {
 		"remote":        remote,
 		"protocol":      proto,
 	}
+	if iceRTT >= 0 {
+		m["iceRttMs"] = float64(iceRTT) / float64(time.Millisecond)
+	}
 	s.mu.Unlock()
 	if s.ctx.Err() == nil {
 		s.stats(m)
@@ -1068,17 +1073,21 @@ func (s *rtcSession) reportStats() {
 
 // candidatePair returns the types of the selected ICE candidate pair's
 // local and remote candidates, and its protocol, from the peer
-// connection's stats; empty strings if there is none yet.
-func (s *rtcSession) candidatePair() (local, remote, proto string) {
+// connection's stats; empty strings if there is none yet. It also
+// returns the pair's round trip as ICE measures it (-1 if unknown): the
+// network's own, timed by the browser off the page's thread, where the
+// pings' (rttMs) include the time each side's page took to answer, and
+// the queue a busy transfer builds ahead of them.
+func (s *rtcSession) candidatePair() (local, remote, proto string, rtt time.Duration) {
 	p, err := jsCall(s.pc, "getStats")
 	if err != nil {
-		return "", "", ""
+		return "", "", "", -1
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, pingInterval)
 	defer cancel()
 	report, err := awaitPromise(ctx, p)
 	if err != nil {
-		return "", "", ""
+		return "", "", "", -1
 	}
 	byID := map[string]js.Value{}
 	var pairID string
@@ -1102,11 +1111,11 @@ func (s *rtcSession) candidatePair() (local, remote, proto string) {
 	_, err = jsCall(report, "forEach", each)
 	each.Release()
 	if err != nil {
-		return "", "", ""
+		return "", "", "", -1
 	}
 	pair, ok := byID[pairID]
 	if !ok {
-		return "", "", ""
+		return "", "", "", -1
 	}
 	str := func(v js.Value, prop string) string {
 		if p := v.Get(prop); p.Type() == js.TypeString {
@@ -1120,7 +1129,11 @@ func (s *rtcSession) candidatePair() (local, remote, proto string) {
 	if c, ok := byID[str(pair, "remoteCandidateId")]; ok {
 		remote = str(c, "candidateType")
 	}
-	return local, remote, proto
+	rtt = -1
+	if v := pair.Get("currentRoundTripTime"); v.Type() == js.TypeNumber {
+		rtt = time.Duration(v.Float() * float64(time.Second))
+	}
+	return local, remote, proto, rtt
 }
 
 // askRestart asks the offerer to restart ICE, as only it can, at most

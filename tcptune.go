@@ -12,3 +12,6 @@ import (
 
 // tuneTCP keeps gVisor's TCP defaults outside the browser.
 func tuneTCP(logf logger.Logf, ns *netstack.Impl) {}
+
+// tuneMTU keeps tailscale's tunnel MTU outside the browser.
+func tuneMTU() {}

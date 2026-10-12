@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/profiler"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/tailscale/tailcat"
@@ -1201,6 +1203,43 @@ var stressBytes = flag.Int("web-stress-bytes", 0,
 var stressHide = flag.String("web-stress-hide", "",
 	`TestBrowserWebRTCStress: "send" or "listen" runs that side's browser in a window, minimized during the transfer, with Chrome's throttling of hidden pages on`)
 
+var stressProfile = flag.String("web-stress-profile", "",
+	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory")
+
+// startProfile starts the CPU profiler of the page of ctx, sampling
+// every 100µs.
+func startProfile(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := chromedp.Run(ctx,
+		profiler.Enable(),
+		profiler.SetSamplingInterval(100),
+		profiler.Start(),
+	); err != nil {
+		t.Fatalf("starting the profiler: %v", err)
+	}
+}
+
+// stopProfile stops the CPU profiler of the page of ctx and writes its
+// profile, in Chrome's .cpuprofile format, to path.
+func stopProfile(t *testing.T, ctx context.Context, path string) {
+	t.Helper()
+	var p *profiler.Profile
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) (err error) {
+		p, err = profiler.Stop().Do(ctx)
+		return err
+	})); err != nil {
+		t.Errorf("stopping the profiler: %v", err)
+		return
+	}
+	b, err := json.Marshal(p)
+	if err == nil {
+		err = os.WriteFile(path, b, 0o644)
+	}
+	if err != nil {
+		t.Errorf("writing %s: %v", path, err)
+	}
+}
+
 // hiddenChrome is how TestBrowserWebRTCStress launches the side it hides:
 // in a window it can minimize, and without the switches chromedp passes by
 // default that keep a hidden page's timers and renderer at full speed.
@@ -1274,6 +1313,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	case "listen":
 		minimize(t, p.listen)
 	}
+	if *stressProfile != "" {
+		startProfile(t, p.listen)
+		startProfile(t, p.send)
+	}
 	start := time.Now()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
 
@@ -1304,6 +1347,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		chromedp.Evaluate("window.tcTest.recvBad", &recvBad),
 	)
 	took := time.Since(start)
+	if *stressProfile != "" {
+		stopProfile(t, p.listen, filepath.Join(*stressProfile, "listen.cpuprofile"))
+		stopProfile(t, p.send, filepath.Join(*stressProfile, "send.cpuprofile"))
+	}
 	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
 	if recvBytes != size || recvBad != 0 {
 		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
@@ -1324,6 +1371,12 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
 			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
 		}
+		// The network's round trip, as ICE times it, beside the pings'.
+		var iceRTT float64
+		p.step(tab.ctx, tab.name+": reading ICE's round trip", 10*time.Second,
+			poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`),
+			chromedp.Evaluate(`window.tcTest.stats.iceRttMs`, &iceRTT))
+		t.Logf("%s: round trip %.1f ms by ICE", tab.name, iceRTT)
 	}
 	checkPageErrors(t, p.listen)
 	checkPageErrors(t, p.send)

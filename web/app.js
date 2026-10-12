@@ -63,15 +63,18 @@ function onPathChange({ peerKey, path }) {
 }
 
 // onPathStats shows the direct path's round trip and candidate types
-// while it carries the traffic.
+// while it carries the traffic: the network's round trip as ICE times
+// it, and beside it the tunnel's pings', which add the time each page
+// took to answer.
 function onPathStats(stats) {
   window.tcTest.stats = stats;
   if (stats.path !== "webrtc") {
     return;
   }
+  const ms = (v) => (v < 1 ? "<1" : String(Math.round(v)));
   const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}` : "";
-  document.getElementById("path").textContent =
-    `· direct (WebRTC${route}, ${stats.rttMs < 1 ? "<1" : Math.round(stats.rttMs)} ms)`;
+  const rtt = stats.iceRttMs === undefined ? `${ms(stats.rttMs)} ms` : `${ms(stats.iceRttMs)} ms, tunnel ${ms(stats.rttMs)} ms`;
+  document.getElementById("path").textContent = `· direct (WebRTC${route}, ${rtt})`;
 }
 
 // canonicalDERPMapURL is the public tailcat DERP map, which allows
@@ -372,6 +375,7 @@ if (params.has("timeline")) {
       recv: window.tcTest.recvBytes,
       path: window.tcTest.path,
       rtt: Math.round(s.rttMs || 0),
+      iceRtt: s.iceRttMs,
       dropped: s.dropped || 0,
       recvDropped: s.recvDropped || 0,
       lagMs: Math.round(lag),
