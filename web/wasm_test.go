@@ -765,7 +765,8 @@ func (p *tabPair) step(tab context.Context, name string, timeout time.Duration, 
 	}
 }
 
-// logState logs each open tab's window.tcTest.
+// logState logs each open tab's window.tcTest, and its
+// window.tailcatTestHooks if it has them.
 func (p *tabPair) logState() {
 	for _, tab := range []struct {
 		name string
@@ -776,7 +777,7 @@ func (p *tabPair) logState() {
 		}
 		ctx, cancel := context.WithTimeout(tab.ctx, 5*time.Second)
 		var state string
-		err := chromedp.Run(ctx, chromedp.Evaluate(`JSON.stringify(window.tcTest)`, &state))
+		err := chromedp.Run(ctx, chromedp.Evaluate(`JSON.stringify(window.tcTest) + " hooks: " + JSON.stringify(window.tailcatTestHooks)`, &state))
 		cancel()
 		p.t.Logf("%s tab tcTest: %s (err: %v)", tab.name, state, err)
 	}
@@ -811,8 +812,14 @@ func (p *tabPair) listenTab(srv *httptest.Server, extra url.Values) string {
 }
 
 // checkTransfer waits for the listening tab to receive the sending
-// tab's transfer and checks it arrived intact.
+// tab's transfer of transferSize bytes and checks it arrived intact.
 func (p *tabPair) checkTransfer() {
+	p.t.Helper()
+	p.checkTransferOf(transferSize)
+}
+
+// checkTransferOf is checkTransfer for a transfer of size bytes.
+func (p *tabPair) checkTransferOf(size int) {
 	p.t.Helper()
 	var recvBytes int
 	var recvSum, sentSum string
@@ -825,8 +832,8 @@ func (p *tabPair) checkTransfer() {
 		poll("window.tcTest.sendDone === true"),
 		chromedp.Evaluate("window.tcTest.sentSha256", &sentSum),
 	)
-	if recvBytes != transferSize {
-		p.t.Errorf("listener received %d bytes; want %d", recvBytes, transferSize)
+	if recvBytes != size {
+		p.t.Errorf("listener received %d bytes; want %d", recvBytes, size)
 	}
 	if recvSum != sentSum {
 		p.t.Errorf("listener received sha256 %s; sender sent %s", recvSum, sentSum)
@@ -1006,6 +1013,7 @@ func TestBrowserWebRTCListenerOff(t *testing.T) {
 			"addr":   {addr},
 			"bytes":  {strconv.Itoa(transferSize)},
 			"webrtc": {"host"},
+			"hooks":  {""},
 		}).Encode()),
 	)
 	p.checkTransfer()
@@ -1016,4 +1024,146 @@ func TestBrowserWebRTCListenerOff(t *testing.T) {
 	if path == "webrtc" {
 		t.Errorf("sender reports a WebRTC path to a listener with WebRTC off")
 	}
+	// The listener refuses the signaling port, which says WebRTC is off
+	// there for good: the dialer stops asking rather than retrying as
+	// it would a dial that never reached the listener.
+	p.step(p.send, "the dialer giving up on WebRTC", 30*time.Second,
+		poll(`window.tailcatTestHooks.client === "stopped: refused"`),
+	)
+}
+
+// webrtcTabs opens a listener and a sender, both with WebRTC (host
+// candidates only) and the test hooks, the sender holding a transfer of
+// size bytes until the test sets tcTest.go, and waits for both to
+// report a WebRTC path.
+func (p *tabPair) webrtcTabs(srv *httptest.Server, size int) {
+	p.t.Helper()
+	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}})
+	p.send = newTab(p.t, p.listen, "sender")
+	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
+		chromedp.Navigate(srv.URL+"/?"+withVerbose(url.Values{
+			"mode":     {"send"},
+			"addr":     {addr},
+			"bytes":    {strconv.Itoa(size)},
+			"webrtc":   {"host"},
+			"waitpath": {"webrtc"},
+			"gate":     {""},
+			"hooks":    {""},
+		}).Encode()),
+		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
+	)
+	p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second,
+		poll(`window.tcTest.path === "webrtc"`),
+	)
+}
+
+// eachTab runs actions in both tabs, the listener's first.
+func (p *tabPair) eachTab(name string, timeout time.Duration, actions ...chromedp.Action) {
+	p.t.Helper()
+	p.step(p.listen, "listener: "+name, timeout, actions...)
+	p.step(p.send, "sender: "+name, timeout, actions...)
+}
+
+// checkOnlyWebRTC checks that neither tab ever reported its path down.
+func (p *tabPair) checkOnlyWebRTC() {
+	p.t.Helper()
+	for _, tab := range []struct {
+		name string
+		ctx  context.Context
+	}{{"listener", p.listen}, {"sender", p.send}} {
+		var paths string
+		p.step(tab.ctx, tab.name+": reading the paths reported", 10*time.Second,
+			chromedp.Evaluate(`JSON.stringify(window.tcTest.paths)`, &paths),
+		)
+		if paths != `["webrtc"]` {
+			p.t.Errorf("%s tab reported paths %s; want only [\"webrtc\"]", tab.name, paths)
+		}
+	}
+}
+
+// TestBrowserWebRTCOutage cuts the direct WebRTC path between two tabs
+// off in both directions, without closing it, as a network outage
+// would. Both tabs must move their traffic off it within a few seconds,
+// and the dialer must restart ICE; when the path carries traffic again
+// both must move back to it, never having reported it down. A second
+// outage then checks that a transfer started during one completes, over
+// DERP. (Its sender closes the tunnel when done, which ends the path.)
+func TestBrowserWebRTCOutage(t *testing.T) {
+	const size = 512 << 10
+	p := newTabPair(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+	p.webrtcTabs(srv, size)
+	p.eachTab("path healthy", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
+
+	cut := p.cutPath()
+	p.step(p.send, "the dialer restarting ICE", 10*time.Second,
+		poll(`window.tailcatTestHooks.iceRestarts >= 1 && window.tailcatTestHooks.answers >= 2`),
+	)
+	t.Logf("the dialer restarted ICE %v after the cut", time.Since(cut).Round(time.Millisecond))
+	p.restorePath(cut)
+	p.checkOnlyWebRTC()
+
+	cut = p.cutPath()
+	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
+	p.step(p.listen, "receiving over DERP during the outage", deadAfterForTest-time.Since(cut),
+		poll("window.tcTest.recvDone === true"),
+	)
+	p.checkTransferOf(size)
+}
+
+// cutPath makes both tabs drop what their WebRTC path carries, waits
+// for both to move their traffic off it, and returns when it cut it.
+func (p *tabPair) cutPath() time.Time {
+	p.t.Helper()
+	cut := time.Now()
+	p.eachTab("cutting the path", 5*time.Second, chromedp.Evaluate(`window.tailcatTestHooks.dropRTC = true`, nil))
+	p.eachTab("traffic off the path", 12*time.Second, poll(`window.tailcatTestHooks.state === "suspect"`))
+	p.t.Logf("both tabs moved their traffic off the path %v after the cut", time.Since(cut).Round(time.Millisecond))
+	return cut
+}
+
+// restorePath undoes cutPath, checking that the session survived the
+// outage, and waits for both tabs to move their traffic back.
+func (p *tabPair) restorePath(cut time.Time) {
+	p.t.Helper()
+	if d := time.Since(cut); d >= deadAfterForTest {
+		p.t.Fatalf("the outage lasted %v, long enough to end the session; the test can't check recovery", d)
+	}
+	p.eachTab("restoring the path", 5*time.Second, chromedp.Evaluate(`window.tailcatTestHooks.dropRTC = false`, nil))
+	p.eachTab("traffic back on the path", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
+}
+
+// deadAfterForTest is how long the WebRTC code lets a path go
+// unanswered before ending its session (deadAfter in webrtc_js.go,
+// which this native test can't import), less a tick.
+const deadAfterForTest = 13 * time.Second
+
+// TestBrowserWebRTCNetworkChange has each tab report a network change,
+// as the browser's online event does, while their WebRTC path is up:
+// the listener checks the path, and the dialer restarts ICE. The path
+// must stay up through both, and then carry a transfer on its own,
+// with DERP stopped.
+func TestBrowserWebRTCNetworkChange(t *testing.T) {
+	p := newTabPair(t)
+	dm, stopDERP := runStoppableDERP(t)
+	srv := newWebServer(t, dm)
+	p.webrtcTabs(srv, transferSize)
+	p.eachTab("path healthy", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
+
+	p.step(p.send, "dialer: the network changing", 10*time.Second,
+		chromedp.Evaluate(`window.dispatchEvent(new Event("online"))`, nil),
+		poll(`window.tailcatTestHooks.iceRestarts >= 1 && window.tailcatTestHooks.answers >= 2`),
+	)
+	p.step(p.listen, "listener: the network changing", 5*time.Second,
+		chromedp.Evaluate(`window.dispatchEvent(new Event("online"))`, nil),
+		poll(`window.tailcatTestHooks.netChecks >= 1`),
+	)
+	p.eachTab("path healthy after the change", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
+	p.checkOnlyWebRTC()
+
+	t.Logf("both tabs kept their WebRTC path through the change; stopping DERP")
+	stopDERP()
+	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
+	p.checkTransfer()
 }

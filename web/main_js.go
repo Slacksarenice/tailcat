@@ -148,6 +148,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			srv.Close()
 			return nil, fmt.Errorf("Server.Start: %w", err)
 		}
+		stopNet := watchListenerNetwork(srv, rtc)
 		return map[string]any{
 			"addr":           string(addr),
 			"privateKeyJSON": string(keyOut),
@@ -172,6 +173,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 				})
 			}),
 			"close": js.FuncOf(func(this js.Value, args []js.Value) any {
+				stopNet()
 				if rtc != nil {
 					rtc.close()
 				}

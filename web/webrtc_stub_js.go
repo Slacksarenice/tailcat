@@ -30,3 +30,4 @@ func (*rtcServer) handleSignal(c net.Conn)                                 { c.C
 func (*rtcServer) disconnect(key.NodePublic)                               {}
 func (*rtcServer) close()                                                  {}
 func runRTCClient(context.Context, *tailcat.Client, js.Value, logger.Logf) {}
+func watchListenerNetwork(*tailcat.Server, *rtcServer) (stop func())       { return func() {} }
