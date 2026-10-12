@@ -26,8 +26,9 @@ import (
 // browser the datagrams arrive as events that can run back to back,
 // hundreds at once after the page was busy, before WireGuard's reader
 // runs, so the queue holds full TCP windows: tailcat's browser build
-// lets a connection have 2 MiB in flight (tcptune_js.go), about 1600
-// full-sized datagrams, and the queue is shared by every peer's path.
+// lets a connection have up to 8 MiB in flight (tcptune_js.go), about
+// 930 datagrams at its 9000-byte MTU, and the queue is shared by every
+// peer's path.
 // A smaller queue drops most of a window at once, which leaves TCP in
 // a slow retransmission timeout rather than a fast recovery.
 const packetPathQueueLen = 8192

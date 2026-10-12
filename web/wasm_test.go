@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/profiler"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/tailscale/tailcat"
@@ -1060,6 +1062,118 @@ func (p *tabPair) webrtcTabs(srv *httptest.Server, size int) {
 	)
 }
 
+// TestBrowserWebRTCAddressFamilies connects tabs with each mix of
+// address families: a host with both, IPv4 only, or IPv6 only (the test
+// hook "family", which drops a page's candidates of the other family
+// and the peer's). ICE pairs only candidates of one family, so a
+// dual-stack page, which offers the peer candidates of both, reaches a
+// peer with either over a direct path of that family; pages with one
+// family each share no pair, and the transfer goes over DERP.
+func TestBrowserWebRTCAddressFamilies(t *testing.T) {
+	v6 := hostHasIPv6()
+	for _, tc := range []struct {
+		name         string
+		listen, send string // "4", "6", or "" for both
+		direct       bool
+		wantFamily   string // the direct path's, if it must be this one
+		needsIPv6    bool
+	}{
+		{name: "both to both", direct: true},
+		{name: "IPv4 only to both", send: "4", direct: true, wantFamily: "IPv4"},
+		{name: "both to IPv4 only", listen: "4", direct: true, wantFamily: "IPv4"},
+		{name: "IPv6 only to both", send: "6", direct: true, wantFamily: "IPv6", needsIPv6: true},
+		{name: "both to IPv6 only", listen: "6", direct: true, wantFamily: "IPv6", needsIPv6: true},
+		{name: "IPv4 only to IPv6 only", listen: "6", send: "4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.needsIPv6 && !v6 {
+				t.Skip("this host has no global IPv6 address for Chrome to gather")
+			}
+			p := newTabPair(t)
+			dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+			srv := newWebServer(t, dm)
+			addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "family": {tc.listen}})
+			q := url.Values{
+				"mode":   {"send"},
+				"addr":   {addr},
+				"bytes":  {strconv.Itoa(transferSize)},
+				"webrtc": {"host"},
+				"hooks":  {""},
+				"family": {tc.send},
+			}
+			if tc.direct {
+				q["waitpath"], q["gate"] = []string{"webrtc"}, []string{""}
+			}
+			p.send = newTab(t, p.listen, "sender")
+			p.step(p.send, "sender", 90*time.Second, chromedp.Navigate(srv.URL+"/?"+withVerbose(q).Encode()))
+			if !tc.direct {
+				p.checkTransfer()
+				p.eachTab("reading the path", 10*time.Second, chromedp.ActionFunc(func(ctx context.Context) error {
+					var path string
+					if err := chromedp.Evaluate(`String(window.tcTest.path)`, &path).Do(ctx); err != nil {
+						return err
+					}
+					if path == "webrtc" {
+						t.Errorf("traffic took a direct path between pages with no address family in common")
+					}
+					return nil
+				}))
+				return
+			}
+			p.step(p.send, "sender reaching a WebRTC path", 90*time.Second, poll(`window.tcTest.path === "webrtc"`))
+			p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second, poll(`window.tcTest.path === "webrtc"`))
+			// The path's stats come every ping interval while it lasts:
+			// read them before the transfer, which ends it.
+			for _, tab := range []struct {
+				name, family string
+				ctx          context.Context
+			}{{"listener", tc.listen, p.listen}, {"sender", tc.send, p.send}} {
+				var got struct {
+					Family string  `json:"family"`
+					Cands4 float64 `json:"cands4"`
+					Cands6 float64 `json:"cands6"`
+				}
+				p.step(tab.ctx, tab.name+": reading the path's family", 15*time.Second,
+					poll(`!!(window.tcTest.stats || {}).family`),
+					chromedp.Evaluate(`({family: window.tcTest.stats.family,
+						cands4: window.tailcatTestHooks.cands4 || 0, cands6: window.tailcatTestHooks.cands6 || 0})`, &got))
+				t.Logf("%s: direct path over %s; offered %v IPv4 and %v IPv6 candidates", tab.name, got.Family, got.Cands4, got.Cands6)
+				if tc.wantFamily != "" && got.Family != tc.wantFamily {
+					t.Errorf("%s: direct path over %q; want %q", tab.name, got.Family, tc.wantFamily)
+				}
+				// What each page offers its peer: every candidate of each
+				// family it has, and none of one it hasn't.
+				if tab.family != "6" && got.Cands4 == 0 {
+					t.Errorf("%s offered no IPv4 candidates", tab.name)
+				}
+				if tab.family != "4" && v6 && got.Cands6 == 0 {
+					t.Errorf("%s offered no IPv6 candidates though the host has IPv6", tab.name)
+				}
+				if (tab.family == "4" && got.Cands6 > 0) || (tab.family == "6" && got.Cands4 > 0) {
+					t.Errorf("%s, with IPv%s only, offered %v IPv4 and %v IPv6 candidates", tab.name, tab.family, got.Cands4, got.Cands6)
+				}
+			}
+			p.step(p.send, "starting the send", 10*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
+			p.checkTransfer()
+		})
+	}
+}
+
+// hostHasIPv6 reports whether this host has a global IPv6 address,
+// which Chrome would offer as a host candidate.
+func hostHasIPv6() bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() == nil && n.IP.IsGlobalUnicast() {
+			return true
+		}
+	}
+	return false
+}
+
 // eachTab runs actions in both tabs, the listener's first.
 func (p *tabPair) eachTab(name string, timeout time.Duration, actions ...chromedp.Action) {
 	p.t.Helper()
@@ -1198,8 +1312,48 @@ func (p *tabPair) restorePath(cut time.Time) {
 var stressBytes = flag.Int("web-stress-bytes", 0,
 	"run TestBrowserWebRTCStress, sending this many bytes between two browsers")
 
+var stressDelay = flag.Duration("web-stress-rtt", 0,
+	"TestBrowserWebRTCStress: add this much to the round trip of the tunnel's TCP, by holding each datagram received; the DataChannel's own round trip stays the loopback's, so this tests the tunnel's TCP windows, not a real long path")
+
 var stressHide = flag.String("web-stress-hide", "",
 	`TestBrowserWebRTCStress: "send" or "listen" runs that side's browser in a window, minimized during the transfer, with Chrome's throttling of hidden pages on`)
+
+var stressProfile = flag.String("web-stress-profile", "",
+	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory")
+
+// startProfile starts the CPU profiler of the page of ctx, sampling
+// every 100µs.
+func startProfile(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := chromedp.Run(ctx,
+		profiler.Enable(),
+		profiler.SetSamplingInterval(100),
+		profiler.Start(),
+	); err != nil {
+		t.Fatalf("starting the profiler: %v", err)
+	}
+}
+
+// stopProfile stops the CPU profiler of the page of ctx and writes its
+// profile, in Chrome's .cpuprofile format, to path.
+func stopProfile(t *testing.T, ctx context.Context, path string) {
+	t.Helper()
+	var p *profiler.Profile
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) (err error) {
+		p, err = profiler.Stop().Do(ctx)
+		return err
+	})); err != nil {
+		t.Errorf("stopping the profiler: %v", err)
+		return
+	}
+	b, err := json.Marshal(p)
+	if err == nil {
+		err = os.WriteFile(path, b, 0o644)
+	}
+	if err != nil {
+		t.Errorf("writing %s: %v", path, err)
+	}
+}
 
 // hiddenChrome is how TestBrowserWebRTCStress launches the side it hides:
 // in a window it can minimize, and without the switches chromedp passes by
@@ -1250,7 +1404,8 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
 	srv := newWebServer(t, dm)
 
-	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}})
+	delay := strconv.Itoa(int(stressDelay.Milliseconds() / 2)) // each side holds what it receives
+	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}})
 	p.send = launchChrome(t, bin, opts["send"]...)
 	allocate(t, p.send)
 	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
@@ -1264,6 +1419,7 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			"gate":     {""},
 			"hooks":    {""},
 			"timeline": {""},
+			"delay":    {delay},
 		}).Encode()),
 		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
 	)
@@ -1273,6 +1429,14 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		minimize(t, p.send)
 	case "listen":
 		minimize(t, p.listen)
+	}
+	// Each page's first stats report, ICE's round trip in it, comes a
+	// couple of seconds after its path; a short transfer can end the
+	// session before then.
+	p.eachTab("ICE's round trip", 15*time.Second, poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`))
+	if *stressProfile != "" {
+		startProfile(t, p.listen)
+		startProfile(t, p.send)
 	}
 	start := time.Now()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
@@ -1304,6 +1468,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		chromedp.Evaluate("window.tcTest.recvBad", &recvBad),
 	)
 	took := time.Since(start)
+	if *stressProfile != "" {
+		stopProfile(t, p.listen, filepath.Join(*stressProfile, "listen.cpuprofile"))
+		stopProfile(t, p.send, filepath.Join(*stressProfile, "send.cpuprofile"))
+	}
 	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
 	if recvBytes != size || recvBad != 0 {
 		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
@@ -1324,6 +1492,12 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
 			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
 		}
+		// The network's round trip, as ICE last timed it, beside the
+		// pings'.
+		var iceRTT float64
+		p.step(tab.ctx, tab.name+": reading ICE's round trip", 10*time.Second,
+			chromedp.Evaluate(`window.tcTest.stats.iceRttMs`, &iceRTT))
+		t.Logf("%s: round trip %.1f ms by ICE", tab.name, iceRTT)
 	}
 	checkPageErrors(t, p.listen)
 	checkPageErrors(t, p.send)

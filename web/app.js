@@ -31,9 +31,12 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 
 // With ?hooks, the Go side reports its WebRTC path's state into
 // tailcatTestHooks, and the test can steer it from there (see
-// webrtc_js.go): dropRTC discards what the DataChannel receives.
+// webrtc_js.go): dropRTC discards what the DataChannel receives, family
+// ("4" or "6", from ?family) makes the page's WebRTC act as on a host
+// with only that address family, and delayMs (from ?delay) holds each
+// datagram received that long, for a longer round trip.
 if (params.has("hooks")) {
-  window.tailcatTestHooks = { dropRTC: false };
+  window.tailcatTestHooks = { dropRTC: false, family: params.get("family") || "", delayMs: Number(params.get("delay")) || 0 };
 }
 
 if (params.has("webrtc")) {
@@ -63,15 +66,19 @@ function onPathChange({ peerKey, path }) {
 }
 
 // onPathStats shows the direct path's round trip and candidate types
-// while it carries the traffic.
+// while it carries the traffic: the network's round trip as ICE times
+// it, and beside it the tunnel's pings', which add the time each page
+// took to answer.
 function onPathStats(stats) {
   window.tcTest.stats = stats;
   if (stats.path !== "webrtc") {
     return;
   }
-  const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}` : "";
-  document.getElementById("path").textContent =
-    `· direct (WebRTC${route}, ${stats.rttMs < 1 ? "<1" : Math.round(stats.rttMs)} ms)`;
+  const ms = (v) => (v < 1 ? "<1" : String(Math.round(v)));
+  const family = stats.family ? ` ${stats.family}` : "";
+  const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}${family}` : "";
+  const rtt = stats.iceRttMs === undefined ? `${ms(stats.rttMs)} ms` : `${ms(stats.iceRttMs)} ms, tunnel ${ms(stats.rttMs)} ms`;
+  document.getElementById("path").textContent = `· direct (WebRTC${route}, ${rtt})`;
 }
 
 // canonicalDERPMapURL is the public tailcat DERP map, which allows
@@ -372,6 +379,7 @@ if (params.has("timeline")) {
       recv: window.tcTest.recvBytes,
       path: window.tcTest.path,
       rtt: Math.round(s.rttMs || 0),
+      iceRtt: s.iceRttMs,
       dropped: s.dropped || 0,
       recvDropped: s.recvDropped || 0,
       lagMs: Math.round(lag),

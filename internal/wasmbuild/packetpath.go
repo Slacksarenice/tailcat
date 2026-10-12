@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,43 +32,59 @@ const PacketPathTag = "tailcat_webrtc"
 //go:embed magicsockpatch/packetpath.go.in
 var packetPathSource []byte
 
-// magicsockEdit is one insertion into a tailscale.com magicsock file.
-// The anchor must occur exactly once; text is inserted immediately
-// before or after it.
+// derpShedSource is the derphttp file the patch adds.
+//
+//go:embed magicsockpatch/derpshed.go.in
+var derpShedSource []byte
+
+// patchFiles are the files the patch adds to tailscale.com, by path in
+// the module.
+var patchFiles = []struct {
+	path string
+	src  *[]byte
+}{
+	{"wgengine/magicsock/packetpath.go", &packetPathSource},
+	{"derp/derphttp/derpshed.go", &derpShedSource},
+}
+
+// magicsockEdit is one insertion into a tailscale.com file. The anchor
+// must occur exactly once; text is inserted immediately before or after
+// it.
 type magicsockEdit struct {
-	file   string // file name in tailscale.com/wgengine/magicsock
+	file   string // path in the tailscale.com module
 	anchor string
 	text   string
 	before bool // insert before the anchor instead of after it
 }
 
-// packetPathEdits wire packetpath.go into magicsock. They are kept to
-// the minimum the hook needs so that a tailscale.com upgrade rarely
-// disturbs them; if one does, PacketPathModfile fails, naming it.
+// packetPathEdits wire packetpath.go into magicsock, and derpshed.go
+// into derphttp. They are kept to the minimum the hooks need so that a
+// tailscale.com upgrade rarely disturbs them; if one does,
+// PacketPathModfile fails, naming it.
 var packetPathEdits = []magicsockEdit{
 	{
 		// The Conn's packet path state.
-		file:   "magicsock.go",
+		file:   "wgengine/magicsock/magicsock.go",
 		anchor: "\tderpRecvCh chan derpReadResult\n",
 		text:   "\n\t// packetPaths are embedder-supplied peer paths; see packetpath.go.\n\tpacketPaths packetPathState\n",
 	},
 	{
 		// connBind.Open: also receive from packet paths.
-		file:   "magicsock.go",
+		file:   "wgengine/magicsock/magicsock.go",
 		anchor: "\treturn fns, c.LocalPort(), nil\n",
 		text:   "\tfns = append(fns, c.receivePacketPath)\n",
 		before: true,
 	},
 	{
 		// connBind.Close: wake a receivePacketPath waiting for a datagram.
-		file:   "magicsock.go",
+		file:   "wgengine/magicsock/magicsock.go",
 		anchor: "\tc.derpRecvCh <- derpReadResult{}\n",
 		text:   "\tc.wakePacketPathRecv()\n",
 	},
 	{
 		// endpoint.send: offer datagrams to the peer's packet path
 		// first, after the send has been noted for idle tracking.
-		file:   "endpoint.go",
+		file:   "wgengine/magicsock/endpoint.go",
 		anchor: "\tde.lastSendAny = now\n\tde.mu.Unlock()\n",
 		text: "\n\tif n := de.c.sendPacketPath(de.publicKey, buffs, offset); n > 0 {\n" +
 			"\t\tbuffs = buffs[n:]\n" +
@@ -75,6 +92,14 @@ var packetPathEdits = []magicsockEdit{
 			"\t\t\treturn nil\n" +
 			"\t\t}\n" +
 			"\t}\n",
+	},
+	{
+		// derphttp.Client.Send: let the connection's queue shed the
+		// datagram (see derpshed.go) once connected.
+		file:   "derp/derphttp/derphttp_client.go",
+		anchor: "\tif err := client.Send(dstKey, b); err != nil {\n",
+		text:   "\tif c.shedPacket(len(b)) {\n\t\treturn nil\n\t}\n",
+		before: true,
 	},
 }
 
@@ -125,7 +150,7 @@ func applyEdits(file string, src []byte, edits []magicsockEdit) ([]byte, error) 
 			continue
 		}
 		if n := strings.Count(s, e.anchor); n != 1 {
-			return nil, fmt.Errorf("magicsock packet path patch: anchor %q occurs %d times in %s, want 1; did the tailscale.com dependency change? Update internal/wasmbuild/packetpath.go", e.anchor, n, file)
+			return nil, fmt.Errorf("tailscale.com packet path patch: anchor %q occurs %d times in %s, want 1; did the tailscale.com dependency change? Update internal/wasmbuild/packetpath.go", e.anchor, n, file)
 		}
 		i := strings.Index(s, e.anchor)
 		if !e.before {
@@ -143,7 +168,10 @@ func patchHash() string {
 	for _, e := range packetPathEdits {
 		fmt.Fprintf(h, "%q %q %q %v\n", e.file, e.anchor, e.text, e.before)
 	}
-	h.Write(packetPathSource)
+	for _, f := range patchFiles {
+		fmt.Fprintf(h, "%q\n", f.path)
+		h.Write(*f.src)
+	}
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
@@ -187,9 +215,14 @@ func patchedTailscale(modRoot string) (string, error) {
 	if err := copyModule(srcDir, tmp); err != nil {
 		return "", err
 	}
-	msDir := filepath.Join(tmp, "wgengine", "magicsock")
-	for _, name := range []string{"magicsock.go", "endpoint.go"} {
-		p := filepath.Join(msDir, name)
+	var edited []string
+	for _, e := range packetPathEdits {
+		if !slices.Contains(edited, e.file) {
+			edited = append(edited, e.file)
+		}
+	}
+	for _, name := range edited {
+		p := filepath.Join(tmp, filepath.FromSlash(name))
 		src, err := os.ReadFile(p)
 		if err != nil {
 			return "", err
@@ -202,8 +235,10 @@ func patchedTailscale(modRoot string) (string, error) {
 			return "", err
 		}
 	}
-	if err := os.WriteFile(filepath.Join(msDir, "packetpath.go"), packetPathSource, 0644); err != nil {
-		return "", err
+	for _, f := range patchFiles {
+		if err := os.WriteFile(filepath.Join(tmp, filepath.FromSlash(f.path)), *f.src, 0644); err != nil {
+			return "", err
+		}
 	}
 	// On Windows a rename can fail for a moment while something (an
 	// antivirus scanner, an indexer) still holds a file just written.

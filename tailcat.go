@@ -1888,6 +1888,7 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 
 // createEngine creates the wgengine.Engine with userspace networking.
 func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
+	tuneMTU()
 	sys := &lb.sys
 	conf := wgengine.Config{
 		ListenPort:    0,

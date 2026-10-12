@@ -1,0 +1,46 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+// This file is not part of tailscale.com. The tailcat repository keeps
+// it in internal/wasmbuild/magicsockpatch, and its wasm build adds it
+// to a copy of tailscale.com/derp/derphttp, together with a small edit
+// to Client.Send that calls into it; see internal/wasmbuild/packetpath.go
+// there.
+
+package derphttp
+
+import (
+	"context"
+	"net"
+)
+
+// SetWebsocketDialer replaces how a Client dials its DERP server over a
+// WebSocket, as it does in a browser, with dial. It is for a program
+// whose connections need more than the default dialer gives, such as a
+// connection that implements [PacketShedder]. It must be called before
+// any Client connects.
+func SetWebsocketDialer(dial func(ctx context.Context, urlStr string) (net.Conn, error)) {
+	dialWebsocketFunc = dial
+}
+
+// PacketShedder is implemented by a connection, from a dialer that
+// [SetWebsocketDialer] installed, whose writes never block however much
+// it holds unsent: a browser's WebSocket. Unbounded, that queue holds
+// whatever the tunnel's TCP has in flight, and every round trip through
+// it grows by as much. Client.Send asks the connection before sending
+// each packet, and drops the packet if ShedPacket, given its size,
+// reports true, which inner TCP answers by slowing down. Packets are
+// shed whole, before they are framed: the connection's byte stream is
+// never cut.
+type PacketShedder interface {
+	ShedPacket(size int) bool
+}
+
+// shedPacket reports whether c's connection sheds a packet of size bytes.
+func (c *Client) shedPacket(size int) bool {
+	c.mu.Lock()
+	nc := c.netConn
+	c.mu.Unlock()
+	s, ok := nc.(PacketShedder)
+	return ok && s.ShedPacket(size)
+}

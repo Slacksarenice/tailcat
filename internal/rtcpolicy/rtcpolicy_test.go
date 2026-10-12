@@ -491,44 +491,145 @@ func TestLivenessSlowRTT(t *testing.T) {
 	}
 }
 
+// newShedder returns a Shedder whose line, until it measures a rate, is
+// 100 bytes.
+func newShedder() *Shedder {
+	return &Shedder{
+		Target:       20 * time.Millisecond,
+		MinLimit:     50,
+		InitialLimit: 100,
+		HardLimit:    1000,
+		Every:        100 * time.Millisecond,
+	}
+}
+
 func TestShedder(t *testing.T) {
-	s := &Shedder{SoftLimit: 100, HardLimit: 1000, Every: 100 * time.Millisecond}
+	s := newShedder()
 	steps := []struct {
 		at       float64
 		buffered int
 		want     bool
 	}{
-		{0, 100, false},     // at the soft limit: nothing dropped
-		{0.01, 101, true},   // above it: one drop
-		{0.02, 500, false},  // then none until Every has passed
-		{0.109, 900, false}, //
-		{0.111, 500, true},  // the next one
-		{0.12, 1001, true},  // above the hard limit: every datagram
-		{0.13, 1001, true},  //
-		{0.14, 500, false},  // a hard-limit drop doesn't count as the soft one's
-		{0.22, 500, true},   //
-		{0.215, 50, false},  // drained
-		{0.5, 101, true},    // full again, long after the last drop
+		{0, 100, false},    // at the line: nothing dropped
+		{0.01, 101, false}, // above it: a burst, until it stands for Every
+		{0.05, 900, false}, //
+		{0.111, 500, true}, // it has stood: one drop
+		{0.15, 900, false}, // then none until Every has passed
+		{0.212, 500, true}, // the next one
+		{0.22, 1001, true}, // above the hard limit: every datagram
+		{0.23, 1001, true}, //
+		{0.24, 500, false}, // a hard-limit drop doesn't count as the line's
+		{0.313, 500, true}, //
+		{0.32, 50, false},  // drained
+		{0.33, 500, false}, // above again: a new burst
+		{0.441, 500, true}, // that stood
+		{0.45, 2000, true}, //
+		{0.46, 100, false}, //
+		{0.47, 1001, true}, // the hard limit needs no standing queue
+		{0.48, 500, false}, //
+		{0.585, 500, true}, //
 	}
 	for _, st := range steps {
-		if got := s.Drop(st.buffered, at(st.at)); got != st.want {
+		if got := s.Drop(st.buffered, 0, at(st.at)); got != st.want {
 			t.Errorf("at %vs with %d buffered: Drop = %v, want %v", st.at, st.buffered, got, st.want)
 		}
 	}
 }
 
-// TestShedderTrickle: a buffer that stays above the soft limit sheds
-// steadily, one datagram per Every, however many are sent.
+// TestShedderTrickle: a buffer that stays above the line sheds steadily,
+// one datagram per Every once it has stood for Every, however many are
+// sent.
 func TestShedderTrickle(t *testing.T) {
-	s := &Shedder{SoftLimit: 100, HardLimit: 1000, Every: 100 * time.Millisecond}
+	s := newShedder()
 	dropped := 0
 	for i := range 10000 { // a datagram every 100µs for a second
-		if s.Drop(500, at(float64(i)*0.0001)) {
+		if s.Drop(500, 0, at(float64(i)*0.0001)) {
 			dropped++
 		}
 	}
-	if dropped != 10 {
-		t.Errorf("dropped %d of 10000 datagrams in a second above the soft limit; want 10", dropped)
+	if dropped != 9 {
+		t.Errorf("dropped %d of 10000 datagrams in a second above the line; want 9", dropped)
+	}
+}
+
+// TestShedderBursts: bursts that cross the line and drain within Every,
+// as a TCP window sent at once does, are never shed.
+func TestShedderBursts(t *testing.T) {
+	s := newShedder()
+	for b := range 100 { // a burst every 100ms
+		start := float64(b) * 0.1
+		for i, buffered := range []int{90, 300, 600, 900, 600, 300, 0} {
+			if s.Drop(buffered, 0, at(start+float64(i)*0.01)) {
+				t.Fatalf("burst %d, step %d (%d buffered): dropped", b, i, buffered)
+			}
+		}
+	}
+}
+
+// path simulates a send buffer in front of a link that drains it at rate
+// bytes per second, fed by a sender offering size-byte datagrams every
+// gap, through s, for dur. It returns the most bytes the buffer held
+// once the first second had passed, and the datagrams s dropped.
+func simulatePath(t *testing.T, s *Shedder, rate float64, size int, gap time.Duration, dur time.Duration) (maxQueued int, dropped int) {
+	t.Helper()
+	queued := 0.0
+	var prev time.Duration
+	for now := time.Duration(0); now < dur; now += gap {
+		queued = max(queued-rate*(now-prev).Seconds(), 0)
+		prev = now
+		if s.Drop(int(queued), size, t0.Add(now)) {
+			dropped++
+			continue
+		}
+		queued += float64(size)
+		if now > time.Second {
+			maxQueued = max(maxQueued, int(queued))
+		}
+	}
+	return maxQueued, dropped
+}
+
+// TestShedderMeasuresRate: the line follows the path's speed, so it
+// holds about Target of queue on a slow path and on a fast one alike.
+func TestShedderMeasuresRate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rate float64 // bytes per second the link drains
+	}{
+		{"1 MB/s", 1e6},
+		{"10 MB/s", 10e6},
+		{"60 MB/s", 60e6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Shedder{
+				Target:       20 * time.Millisecond,
+				MinLimit:     16 << 10,
+				InitialLimit: 256 << 10,
+				HardLimit:    8 << 20,
+				Every:        100 * time.Millisecond,
+			}
+			// The sender offers twice what the link carries.
+			const size = 9000
+			gap := time.Duration(float64(size) / (2 * tc.rate) * float64(time.Second))
+			simulatePath(t, s, tc.rate, size, gap, 3*time.Second)
+			if got := s.Rate(); got < 0.9*tc.rate || got > 1.1*tc.rate {
+				t.Errorf("measured %.3g B/s; want about %.3g", got, tc.rate)
+			}
+			want := max(int(tc.rate*0.02), 16<<10)
+			if got := s.Limit(); got < want*9/10 || got > want*11/10 {
+				t.Errorf("line at %d bytes; want about %d (20ms at the link's rate)", got, want)
+			}
+		})
+	}
+}
+
+// TestShedderIdleRate: a buffer that never backs up measures no rate, so
+// the line stays InitialLimit and nothing is dropped.
+func TestShedderIdleRate(t *testing.T) {
+	s := newShedder()
+	_, dropped := simulatePath(t, s, 1e6, 10, 100*time.Millisecond, 2*time.Second)
+	if s.Rate() != 0 || dropped != 0 {
+		t.Errorf("rate %v, %d dropped; want no rate measured and none dropped", s.Rate(), dropped)
 	}
 }
 
