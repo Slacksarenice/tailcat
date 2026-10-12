@@ -361,6 +361,7 @@ type rtcSession struct {
 	mu             sync.Mutex
 	dc             js.Value
 	ctl            js.Value // the control channel, while open; undefined otherwise
+	ctlSeen        bool     // a control channel was attached: a session takes one
 	path           *tailcat.PacketPath
 	sentBytes      int64
 	recvBytes      int64
@@ -743,12 +744,14 @@ func (s *rtcSession) describe() error {
 }
 
 // acceptChannel waits for the dialer's DataChannels; the listener calls
-// it. A session carries one of each kind, so any others are closed.
+// it. A session carries one of each kind, so any others are closed,
+// including a control channel opened after the first one closed: each
+// attached channel's handlers last as long as the session.
 func (s *rtcSession) acceptChannel() {
 	s.on(s.pc, "ondatachannel", func(ev js.Value) {
 		dc := ev.Get("channel")
 		s.mu.Lock()
-		dataTaken, ctlTaken := !s.dc.IsUndefined(), !s.ctl.IsUndefined()
+		dataTaken, ctlTaken := !s.dc.IsUndefined(), s.ctlSeen
 		s.mu.Unlock()
 		switch label := dc.Get("label").String(); {
 		case label == dataChannelName && !dataTaken:
@@ -775,11 +778,13 @@ func (s *rtcSession) attachChannel(dc js.Value) {
 }
 
 // attachControl attaches the control channel. Losing it doesn't end the
-// session: the pings go over the datagrams' channel instead.
+// session: the pings go over the datagrams' channel instead, for the
+// rest of the session.
 func (s *rtcSession) attachControl(ctl js.Value) {
 	ctl.Set("binaryType", "arraybuffer")
 	s.mu.Lock()
 	s.ctl = ctl
+	s.ctlSeen = true
 	s.mu.Unlock()
 	s.on(ctl, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
 	opened := func() {

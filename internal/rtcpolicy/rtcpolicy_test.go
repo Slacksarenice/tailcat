@@ -405,6 +405,26 @@ func TestLivenessHoldExpires(t *testing.T) {
 	}
 }
 
+// TestLivenessHoldThrottled: this side's timer gaps (a hidden tab's
+// throttled timers) neither cancel a recovery waiting out its hold nor
+// impose one: with ticks ten seconds apart and each fresh ping answered
+// at once, a held path returns once its hold has passed, and a path that
+// went Suspect only for a gap returns on the first answer.
+func TestLivenessHoldThrottled(t *testing.T) {
+	l := relapsed(t) // holding until 15.1s
+	st, seq := l.Tick(at(20))
+	if st != Suspect {
+		t.Fatalf("after a 12s gap: %v; want Suspect", st)
+	}
+	if !l.Pong(seq, at(20.1)) {
+		t.Fatalf("an answer after the hold had passed, across a timer gap, didn't recover the path")
+	}
+	_, seq = l.Tick(at(30)) // another gap, 10s after recovering: no relapse
+	if !l.Pong(seq, at(30.1)) {
+		t.Errorf("a path Suspect only for a timer gap was held")
+	}
+}
+
 // TestLivenessSlowRTT: a round trip longer than the ping interval is
 // measured, each answer timed against its own ping, and a path that
 // answers every ping that slowly stays Healthy.

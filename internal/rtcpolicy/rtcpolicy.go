@@ -75,7 +75,9 @@ type Liveness struct {
 	// such relapse, and a path that stays healthy for StableFor drops
 	// it. A path that flaps (a congested uplink, a link that comes and
 	// goes) then settles on the relay instead of dragging the tunnel's
-	// traffic back and forth. Zero MaxHold disables the hold.
+	// traffic back and forth. Zero MaxHold disables the hold. Only a
+	// relapse is held: a path Suspect because this side's timers were
+	// held back returns on the first answer to a fresh ping.
 	MinHold, MaxHold, StableFor time.Duration
 
 	seq       uint32
@@ -92,7 +94,8 @@ type Liveness struct {
 	srtt      time.Duration
 	lastHeard time.Time // when traffic last arrived over the path
 
-	hold          time.Duration // the hold the next recovery waits out
+	hold          time.Duration // the hold a relapse's recovery waits out
+	held          bool          // the current outage is a relapse: its recovery waits out the hold
 	recoverAt     time.Time     // a recovery waiting out its hold, if non-zero
 	lastRecovered time.Time
 }
@@ -177,16 +180,21 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	return Healthy, seq
 }
 
-// becomeSuspect marks the path Suspect, cancelling any recovery waiting
-// out its hold. relapse is false when the cause is this side's own
-// (throttled timers): that isn't held against the path, though a path
-// that has stayed healthy for StableFor still drops its old hold.
+// becomeSuspect marks the path Suspect. relapse is false when the cause
+// is this side's own (throttled timers): that isn't held against the
+// path, so it neither cancels a recovery waiting out its hold (the time
+// in between counts toward it) nor starts a hold of its own, though a
+// path that has stayed healthy for StableFor still drops its old hold.
+// A relapse cancels a recovery under way, and one soon after the last
+// recovery makes this outage's recovery wait out a doubled hold.
 func (l *Liveness) becomeSuspect(now time.Time, relapse bool) {
-	l.recoverAt = time.Time{}
+	if relapse {
+		l.recoverAt = time.Time{}
+	}
 	if l.suspect {
 		return
 	}
-	l.suspect = true
+	l.suspect, l.held = true, false
 	if l.MaxHold == 0 {
 		return
 	}
@@ -195,6 +203,7 @@ func (l *Liveness) becomeSuspect(now time.Time, relapse bool) {
 		l.hold = 0
 	case relapse:
 		l.hold = min(max(2*l.hold, l.MinHold), l.MaxHold)
+		l.held = true
 	}
 }
 
@@ -211,8 +220,8 @@ func (l *Liveness) Heard(now time.Time) { l.lastHeard = now }
 // ping sent since the current wait began ends it: later pings may still
 // be queued behind data on a slow uplink. It reports whether the path
 // was Suspect and traffic may return to it now; a path that relapsed
-// soon after its last recovery returns only once Tick finds it has kept
-// answering for its hold.
+// soon after its last recovery returns only once it has kept answering
+// for its hold (Tick finds it so, or an answer comes after the hold).
 func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
 	if p := &l.sent[seq%rttSlots]; p.seq == seq && !p.at.IsZero() {
 		if rtt := now.Sub(p.at); rtt >= 0 {
@@ -231,11 +240,13 @@ func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
 	if !l.suspect {
 		return false
 	}
-	if l.hold > 0 {
+	if l.held {
 		if l.recoverAt.IsZero() {
 			l.recoverAt = now.Add(l.hold)
 		}
-		return false
+		if now.Before(l.recoverAt) {
+			return false
+		}
 	}
 	l.recover(now)
 	return true
