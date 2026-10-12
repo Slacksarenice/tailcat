@@ -246,6 +246,7 @@ func newPathNotifier(opts js.Value) pathNotifier {
 //	  sentBytes: number,       // datagram bytes sent over the WebRTC path
 //	  receivedBytes: number,   // and received over it
 //	  dropped: number,         // datagrams dropped because the channel's buffer was full
+//	  recvDropped: number,     // datagrams received but dropped because WireGuard was behind
 //	  local: string,           // the selected ICE candidate pair's types ("host",
 //	  remote: string,          // "srflx", "prflx" or "relay"), "" until known
 //	  protocol: string,        // "udp" or "tcp", "" until known
@@ -372,6 +373,7 @@ type rtcSession struct {
 	sentBytes      int64
 	recvBytes      int64
 	dropped        int64
+	recvDropped    int64
 	lastRestartAt  time.Time // when the last ICE restart began (offerer)
 	lastRestartAsk time.Time // when this side last asked for one (answerer)
 	peerRestarts   bool      // the offerer takes "restart" (answerer; see signalMsg.Caps)
@@ -913,8 +915,10 @@ func (s *rtcSession) onMessage(data js.Value) {
 		s.recvBytes += int64(n - frameHeaderLen)
 		s.live.Heard(time.Now())
 		s.mu.Unlock()
-		if p != nil {
-			p.Deliver(b[frameHeaderLen:])
+		if p != nil && !p.Deliver(b[frameHeaderLen:]) {
+			s.mu.Lock()
+			s.recvDropped++
+			s.mu.Unlock()
 		}
 	case frameProbe, framePing:
 		if n < frameHeaderLen+4 {
@@ -1051,6 +1055,7 @@ func (s *rtcSession) reportStats() {
 		"sentBytes":     float64(s.sentBytes),
 		"receivedBytes": float64(s.recvBytes),
 		"dropped":       float64(s.dropped),
+		"recvDropped":   float64(s.recvDropped),
 		"local":         local,
 		"remote":        remote,
 		"protocol":      proto,

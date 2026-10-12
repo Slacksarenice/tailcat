@@ -22,8 +22,14 @@ import (
 
 // packetPathQueueLen bounds the datagrams received over packet paths
 // that are waiting for WireGuard to read them, like a UDP socket's
-// receive buffer. A full queue drops, and inner TCP retransmits.
-const packetPathQueueLen = 256
+// receive buffer. A full queue drops, and inner TCP retransmits. In a
+// browser the datagrams arrive as events that can run back to back,
+// hundreds at once after the page was busy, before WireGuard's reader
+// runs, so the queue holds a full TCP window: tailscale's netstack lets
+// a connection have 6 MiB in flight, about 4800 full-sized datagrams.
+// A smaller queue drops most of a window at once, which leaves TCP in
+// a slow retransmission timeout rather than a fast recovery.
+const packetPathQueueLen = 8192
 
 // packetPathMaxLen is the largest datagram a packet path delivers.
 const packetPathMaxLen = 65535
