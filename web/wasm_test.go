@@ -24,12 +24,14 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
@@ -181,7 +183,7 @@ func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
 
 // launchChrome boots a headless Chrome under chromedp and returns a
 // context whose cancellation tears down the browser.
-func launchChrome(t *testing.T, bin string) context.Context {
+func launchChrome(t *testing.T, bin string, extra ...chromedp.ExecAllocatorOption) context.Context {
 	t.Helper()
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(bin),
@@ -197,6 +199,7 @@ func launchChrome(t *testing.T, bin string) context.Context {
 		chromedp.Flag("disable-features", "site-per-process,Translate,BlinkGenPropertyTrees,WebRtcHideLocalIpsWithMdns"),
 		chromedp.Flag("allow-loopback-in-peer-connection", true),
 	)
+	opts = append(opts, extra...)
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(t.Context(), opts...)
 	t.Cleanup(cancelAlloc)
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx, chromedp.WithLogf(t.Logf))
@@ -1190,6 +1193,140 @@ func (p *tabPair) restorePath(cut time.Time) {
 	}
 	p.eachTab("restoring the path", 5*time.Second, chromedp.Evaluate(`window.tailcatTestHooks.dropRTC = false`, nil))
 	p.eachTab("traffic back on the path", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
+}
+
+var stressBytes = flag.Int("web-stress-bytes", 0,
+	"run TestBrowserWebRTCStress, sending this many bytes between two browsers")
+
+var stressHide = flag.String("web-stress-hide", "",
+	`TestBrowserWebRTCStress: "send" or "listen" runs that side's browser in a window, minimized during the transfer, with Chrome's throttling of hidden pages on`)
+
+// hiddenChrome is how TestBrowserWebRTCStress launches the side it hides:
+// in a window it can minimize, and without the switches chromedp passes by
+// default that keep a hidden page's timers and renderer at full speed.
+var hiddenChrome = []chromedp.ExecAllocatorOption{
+	chromedp.Flag("headless", false),
+	chromedp.Flag("disable-background-timer-throttling", false),
+	chromedp.Flag("disable-backgrounding-occluded-windows", false),
+	chromedp.Flag("disable-renderer-backgrounding", false),
+}
+
+// minimize minimizes the window of the tab of ctx, which makes its page
+// hidden.
+func minimize(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		id, _, err := browser.GetWindowForTarget().Do(ctx)
+		if err != nil {
+			return err
+		}
+		return browser.SetWindowBounds(id, &browser.Bounds{WindowState: browser.WindowStateMinimized}).Do(ctx)
+	})); err != nil {
+		t.Fatalf("minimizing the window: %v", err)
+	}
+}
+
+// TestBrowserWebRTCStress sends a large transfer over a direct WebRTC
+// path between two browsers, each in its own process as two people's
+// would be, with DERP up as the fallback, and logs how each page's
+// transfer, path, round trip and thread fared every second. The path
+// must carry the whole transfer intact without leaving it.
+func TestBrowserWebRTCStress(t *testing.T) {
+	if *stressBytes == 0 {
+		t.Skip("set --web-stress-bytes to run")
+	}
+	size := *stressBytes
+	bin := preflight(t)
+	opts := map[string][]chromedp.ExecAllocatorOption{}
+	switch *stressHide {
+	case "":
+	case "send", "listen":
+		opts[*stressHide] = hiddenChrome
+	default:
+		t.Fatalf("--web-stress-hide=%q; want send or listen", *stressHide)
+	}
+	p := &tabPair{t: t, listen: launchChrome(t, bin, opts["listen"]...)}
+	allocate(t, p.listen)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}})
+	p.send = launchChrome(t, bin, opts["send"]...)
+	allocate(t, p.send)
+	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
+		chromedp.Navigate(srv.URL+"/?"+withVerbose(url.Values{
+			"mode":     {"send"},
+			"addr":     {addr},
+			"bytes":    {strconv.Itoa(size)},
+			"pattern":  {""},
+			"webrtc":   {"host"},
+			"waitpath": {"webrtc"},
+			"gate":     {""},
+			"hooks":    {""},
+			"timeline": {""},
+		}).Encode()),
+		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
+	)
+	p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second, poll(`window.tcTest.path === "webrtc"`))
+	switch *stressHide {
+	case "send":
+		minimize(t, p.send)
+	case "listen":
+		minimize(t, p.listen)
+	}
+	start := time.Now()
+	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
+
+	defer func() {
+		for _, tab := range []struct {
+			name string
+			ctx  context.Context
+		}{{"listener", p.listen}, {"sender", p.send}} {
+			ctx, cancel := context.WithTimeout(tab.ctx, 10*time.Second)
+			var timeline, paths, hooks string
+			chromedp.Run(ctx,
+				chromedp.Evaluate(`(window.tcTest.timeline || []).map(JSON.stringify).join("\n")`, &timeline),
+				chromedp.Evaluate(`JSON.stringify(window.tcTest.paths) + " maxLagMs=" + window.tcTest.maxLagMs`, &paths),
+				chromedp.Evaluate(`JSON.stringify(window.tailcatTestHooks)`, &hooks),
+			)
+			cancel()
+			t.Logf("%s paths %s\n%s hooks %s\n%s timeline:\n%s", tab.name, paths, tab.name, hooks, tab.name, timeline)
+		}
+	}()
+
+	timeout := 120*time.Second + time.Duration(size/(256<<10))*time.Second
+	var recvBytes, recvBad int
+	var done bool
+	p.step(p.listen, "receiving", timeout,
+		chromedp.Poll("window.tcTest.recvDone === true", &done,
+			chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(timeout)),
+		chromedp.Evaluate("window.tcTest.recvBytes", &recvBytes),
+		chromedp.Evaluate("window.tcTest.recvBad", &recvBad),
+	)
+	took := time.Since(start)
+	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
+	if recvBytes != size || recvBad != 0 {
+		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
+	}
+	for _, tab := range []struct {
+		name string
+		ctx  context.Context
+	}{{"listener", p.listen}, {"sender", p.send}} {
+		// Each page records its paths as its side of the transfer
+		// completes, before it closes the connection: the sender once
+		// the listener's close confirms delivery. The tunnel's teardown
+		// that follows may move the traffic, and isn't counted, but a
+		// move to DERP during the transfer is.
+		var paths []string
+		p.step(tab.ctx, tab.name+": reading the paths", 10*time.Second,
+			poll(`window.tcTest.pathsAtDone !== null`),
+			chromedp.Evaluate(`window.tcTest.pathsAtDone`, &paths))
+		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
+			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
+		}
+	}
+	checkPageErrors(t, p.listen)
+	checkPageErrors(t, p.send)
 }
 
 // deadAfterForTest is how long the WebRTC code lets a path go

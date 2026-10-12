@@ -491,6 +491,47 @@ func TestLivenessSlowRTT(t *testing.T) {
 	}
 }
 
+func TestShedder(t *testing.T) {
+	s := &Shedder{SoftLimit: 100, HardLimit: 1000, Every: 100 * time.Millisecond}
+	steps := []struct {
+		at       float64
+		buffered int
+		want     bool
+	}{
+		{0, 100, false},     // at the soft limit: nothing dropped
+		{0.01, 101, true},   // above it: one drop
+		{0.02, 500, false},  // then none until Every has passed
+		{0.109, 900, false}, //
+		{0.111, 500, true},  // the next one
+		{0.12, 1001, true},  // above the hard limit: every datagram
+		{0.13, 1001, true},  //
+		{0.14, 500, false},  // a hard-limit drop doesn't count as the soft one's
+		{0.22, 500, true},   //
+		{0.215, 50, false},  // drained
+		{0.5, 101, true},    // full again, long after the last drop
+	}
+	for _, st := range steps {
+		if got := s.Drop(st.buffered, at(st.at)); got != st.want {
+			t.Errorf("at %vs with %d buffered: Drop = %v, want %v", st.at, st.buffered, got, st.want)
+		}
+	}
+}
+
+// TestShedderTrickle: a buffer that stays above the soft limit sheds
+// steadily, one datagram per Every, however many are sent.
+func TestShedderTrickle(t *testing.T) {
+	s := &Shedder{SoftLimit: 100, HardLimit: 1000, Every: 100 * time.Millisecond}
+	dropped := 0
+	for i := range 10000 { // a datagram every 100µs for a second
+		if s.Drop(500, at(float64(i)*0.0001)) {
+			dropped++
+		}
+	}
+	if dropped != 10 {
+		t.Errorf("dropped %d of 10000 datagrams in a second above the soft limit; want 10", dropped)
+	}
+}
+
 func TestCheckDataOnly(t *testing.T) {
 	const head = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"
 	data := "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\n"
