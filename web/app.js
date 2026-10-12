@@ -31,9 +31,11 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 
 // With ?hooks, the Go side reports its WebRTC path's state into
 // tailcatTestHooks, and the test can steer it from there (see
-// webrtc_js.go): dropRTC discards what the DataChannel receives.
+// webrtc_js.go): dropRTC discards what the DataChannel receives, and
+// family ("4" or "6", from ?family) makes the page's WebRTC act as on a
+// host with only that address family.
 if (params.has("hooks")) {
-  window.tailcatTestHooks = { dropRTC: false };
+  window.tailcatTestHooks = { dropRTC: false, family: params.get("family") || "" };
 }
 
 if (params.has("webrtc")) {
@@ -72,7 +74,8 @@ function onPathStats(stats) {
     return;
   }
   const ms = (v) => (v < 1 ? "<1" : String(Math.round(v)));
-  const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}` : "";
+  const family = stats.family ? ` ${stats.family}` : "";
+  const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}${family}` : "";
   const rtt = stats.iceRttMs === undefined ? `${ms(stats.rttMs)} ms` : `${ms(stats.iceRttMs)} ms, tunnel ${ms(stats.rttMs)} ms`;
   document.getElementById("path").textContent = `· direct (WebRTC${route}, ${rtt})`;
 }

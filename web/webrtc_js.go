@@ -47,6 +47,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -252,6 +253,8 @@ func newPathNotifier(opts js.Value) pathNotifier {
 //	  local: string,           // the selected ICE candidate pair's types ("host",
 //	  remote: string,          // "srflx", "prflx" or "relay"), "" until known
 //	  protocol: string,        // "udp" or "tcp", "" until known
+//	  family: string,          // the pair's address family, "IPv4" or "IPv6"; "" until known
+//	  iceRttMs?: number,       // the pair's round trip as ICE measures it, once it has
 //	}
 type pathStatsFunc func(m map[string]any)
 
@@ -364,6 +367,10 @@ type rtcSession struct {
 	// last one it heard ("" for none).
 	notifyMu sync.Mutex
 	reported string
+	// pair is the selected candidate pair as last read, reported again
+	// when a read of the browser's stats fails or comes too late, rather
+	// than blanking the page's view of the path for a report.
+	pair selectedPair
 
 	// mu guards the fields below, which JS callbacks and the session's
 	// goroutines share.
@@ -467,6 +474,17 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 		c := ev.Get("candidate")
 		if c.IsNull() || c.IsUndefined() {
 			return
+		}
+		// Every candidate goes to the peer, of either address family:
+		// ICE pairs only candidates of one family, so a dual-stack
+		// browser's peer can have IPv4 only, or IPv6 only, and still
+		// find a pair.
+		if s.hooks.Truthy() {
+			fam := rtcpolicy.CandidateFamily(c.Get("candidate").String())
+			if s.hookDropsFamily(fam) {
+				return
+			}
+			s.countHook("cands" + cmp.Or(fam, "Hidden"))
 		}
 		j := js.Global().Get("JSON").Call("stringify", c)
 		m := signalMsg{T: "cand", Cand: json.RawMessage(j.String())}
@@ -651,6 +669,12 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		}
 		return nil
 	case m.T == "cand":
+		if s.hooks.Truthy() {
+			var c struct{ Candidate string }
+			if json.Unmarshal(m.Cand, &c) == nil && s.hookDropsFamily(rtcpolicy.CandidateFamily(c.Candidate)) {
+				return nil
+			}
+		}
 		s.mu.Lock()
 		if !s.remoteSet {
 			// Candidates can overtake the description they follow.
@@ -1044,8 +1068,17 @@ func (s *rtcSession) reportStats() {
 	if s.stats == nil {
 		return
 	}
-	local, remote, proto, iceRTT := s.candidatePair()
+	pair, ok := s.readSelectedPair()
 	s.mu.Lock()
+	switch {
+	case !ok:
+		// The browser's stats failed or came too late: the pair is as
+		// last read, rather than gone for a report.
+		pair = s.pair
+	case pair.rtt < 0 && pair.id == s.pair.id:
+		pair.rtt = s.pair.rtt
+	}
+	s.pair = pair
 	path := "derp"
 	if s.qualified && !s.live.Suspect() {
 		path = "webrtc"
@@ -1058,12 +1091,13 @@ func (s *rtcSession) reportStats() {
 		"receivedBytes": float64(s.recvBytes),
 		"dropped":       float64(s.dropped),
 		"recvDropped":   float64(s.recvDropped),
-		"local":         local,
-		"remote":        remote,
-		"protocol":      proto,
+		"local":         pair.local,
+		"remote":        pair.remote,
+		"protocol":      pair.proto,
+		"family":        pair.family,
 	}
-	if iceRTT >= 0 {
-		m["iceRttMs"] = float64(iceRTT) / float64(time.Millisecond)
+	if pair.id != "" && pair.rtt >= 0 {
+		m["iceRttMs"] = float64(pair.rtt) / float64(time.Millisecond)
 	}
 	s.mu.Unlock()
 	if s.ctx.Err() == nil {
@@ -1071,23 +1105,38 @@ func (s *rtcSession) reportStats() {
 	}
 }
 
-// candidatePair returns the types of the selected ICE candidate pair's
-// local and remote candidates, and its protocol, from the peer
-// connection's stats; empty strings if there is none yet. It also
-// returns the pair's round trip as ICE measures it (-1 if unknown): the
-// network's own, timed by the browser off the page's thread, where the
-// pings' (rttMs) include the time each side's page took to answer, and
-// the queue a busy transfer builds ahead of them.
-func (s *rtcSession) candidatePair() (local, remote, proto string, rtt time.Duration) {
+// selectedPair is what a session reports of its selected ICE candidate
+// pair.
+type selectedPair struct {
+	id string // the pair's stats id; "" if there is none yet
+	// local and remote are the candidates' types ("host", "srflx",
+	// "prflx" or "relay"), and proto the local one's protocol ("udp"
+	// or "tcp").
+	local, remote, proto string
+	// family is the pair's address family, "IPv4" or "IPv6": ICE pairs
+	// only candidates of one family. "" if the browser hides it.
+	family string
+	// rtt is the pair's round trip as ICE measures it, -1 if unknown:
+	// the network's own, timed by the browser off the page's thread,
+	// where the pings' (rttMs) include the time each side's page took
+	// to answer, and the queue a busy transfer builds ahead of them.
+	rtt time.Duration
+}
+
+// readSelectedPair reads the selected ICE candidate pair from the peer
+// connection's stats: the zero pair, with an rtt of -1, if there is
+// none yet. It reports false if the stats could not be read in time.
+func (s *rtcSession) readSelectedPair() (pair selectedPair, ok bool) {
+	pair.rtt = -1
 	p, err := jsCall(s.pc, "getStats")
 	if err != nil {
-		return "", "", "", -1
+		return pair, false
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, pingInterval)
 	defer cancel()
 	report, err := awaitPromise(ctx, p)
 	if err != nil {
-		return "", "", "", -1
+		return pair, false
 	}
 	byID := map[string]js.Value{}
 	var pairID string
@@ -1111,29 +1160,44 @@ func (s *rtcSession) candidatePair() (local, remote, proto string, rtt time.Dura
 	_, err = jsCall(report, "forEach", each)
 	each.Release()
 	if err != nil {
-		return "", "", "", -1
+		return pair, false
 	}
-	pair, ok := byID[pairID]
-	if !ok {
-		return "", "", "", -1
+	st, found := byID[pairID]
+	if !found {
+		return pair, true
 	}
+	pair.id = pairID
 	str := func(v js.Value, prop string) string {
 		if p := v.Get(prop); p.Type() == js.TypeString {
 			return p.String()
 		}
 		return ""
 	}
-	if c, ok := byID[str(pair, "localCandidateId")]; ok {
-		local, proto = str(c, "candidateType"), str(c, "protocol")
+	// A candidate's address: "address", or "ip" in older browsers. A
+	// remote host candidate's may be an mDNS name, which has no family;
+	// the local candidate's is the browser's own.
+	family := func(c js.Value) string {
+		switch rtcpolicy.AddrFamily(cmp.Or(str(c, "address"), str(c, "ip"))) {
+		case "4":
+			return "IPv4"
+		case "6":
+			return "IPv6"
+		}
+		return ""
 	}
-	if c, ok := byID[str(pair, "remoteCandidateId")]; ok {
-		remote = str(c, "candidateType")
+	if c, ok := byID[str(st, "localCandidateId")]; ok {
+		pair.local, pair.proto, pair.family = str(c, "candidateType"), str(c, "protocol"), family(c)
 	}
-	rtt = -1
-	if v := pair.Get("currentRoundTripTime"); v.Type() == js.TypeNumber {
-		rtt = time.Duration(v.Float() * float64(time.Second))
+	if c, ok := byID[str(st, "remoteCandidateId")]; ok {
+		pair.remote = str(c, "candidateType")
+		if pair.family == "" {
+			pair.family = family(c)
+		}
 	}
-	return local, remote, proto, rtt
+	if v := st.Get("currentRoundTripTime"); v.Type() == js.TypeNumber {
+		pair.rtt = time.Duration(v.Float() * float64(time.Second))
+	}
+	return pair, true
 }
 
 // askRestart asks the offerer to restart ICE, as only it can, at most
@@ -1339,6 +1403,19 @@ func (s *rtcSession) countHook(name string) {
 		n = v.Int()
 	}
 	s.hooks.Set(name, n+1)
+}
+
+// hookDropsFamily reports whether a test page that has only one address
+// family (tailcatTestHooks.family, "4" or "6") drops a candidate of
+// family fam: it neither sends its own of the other family nor takes
+// the peer's, so neither side ever tries a pair of it, as between a
+// host that has that family and one that hasn't.
+func (s *rtcSession) hookDropsFamily(fam string) bool {
+	if !s.hooks.Truthy() || fam == "" {
+		return false
+	}
+	only := s.hooks.Get("family")
+	return only.Type() == js.TypeString && only.String() != "" && only.String() != fam
 }
 
 // testHooks returns the page's tailcatTestHooks object, which the tests'
