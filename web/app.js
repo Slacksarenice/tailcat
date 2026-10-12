@@ -20,11 +20,19 @@ window.tcTest = {
   sentSha256: null,
   sendDone: false,
   path: null, // "webrtc" or "derp" once reported
+  paths: [],  // every path reported, in order
   go: false,  // with ?gate, the sender waits for the test to set this
   errors: [],
 };
 window.addEventListener("error", (e) => window.tcTest.errors.push(String(e.message)));
 window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(String(e.reason)));
+
+// With ?hooks, the Go side reports its WebRTC path's state into
+// tailcatTestHooks, and the test can steer it from there (see
+// webrtc_js.go): dropRTC discards what the DataChannel receives.
+if (params.has("hooks")) {
+  window.tailcatTestHooks = { dropRTC: false };
+}
 
 if (params.has("webrtc")) {
   document.getElementById("use-webrtc").checked = true;
@@ -44,6 +52,7 @@ function webrtcOption() {
 // or through DERP.
 function onPathChange({ peerKey, path }) {
   window.tcTest.path = path;
+  window.tcTest.paths.push(path);
   document.getElementById("path").textContent =
     path === "webrtc" ? "· direct (WebRTC)" : "· relayed (DERP)";
   if (verbose) {

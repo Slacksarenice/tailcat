@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -239,4 +240,157 @@ func TestPacketPathNotStarted(t *testing.T) {
 	if _, err := NewClient("tcx").NewPacketPath(nil); err == nil {
 		t.Error("Client.NewPacketPath before connecting succeeded")
 	}
+	// NetworkChanged before starting does nothing, and doesn't panic.
+	(&Server{}).NetworkChanged()
+	NewClient("tcx").NetworkChanged()
+}
+
+// derpProxy forwards TCP connections to a DERP server, and can make the
+// ones it carries go silent without closing them, as a network change
+// leaves a connection made over the old network.
+type derpProxy struct {
+	ln       net.Listener
+	accepted atomic.Int32
+
+	mu    sync.Mutex
+	conns []*proxiedConn
+}
+
+type proxiedConn struct {
+	silent atomic.Bool // drop what either side sends
+	closed chan struct{}
+}
+
+func newDERPProxy(t *testing.T, target string) *derpProxy {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &derpProxy{ln: ln}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				down.Close()
+				continue
+			}
+			pc := &proxiedConn{closed: make(chan struct{})}
+			p.mu.Lock()
+			p.conns = append(p.conns, pc)
+			p.mu.Unlock()
+			p.accepted.Add(1)
+			pipe := func(dst, src net.Conn, onEOF func()) {
+				buf := make([]byte, 32<<10)
+				for {
+					n, err := src.Read(buf)
+					if err != nil {
+						onEOF()
+						dst.Close()
+						src.Close()
+						return
+					}
+					if pc.silent.Load() {
+						continue
+					}
+					if _, err := dst.Write(buf[:n]); err != nil {
+						src.Close()
+						return
+					}
+				}
+			}
+			go pipe(up, down, func() { close(pc.closed) }) // the DERP client closed
+			go pipe(down, up, func() {})
+			t.Cleanup(func() {
+				down.Close()
+				up.Close()
+			})
+		}
+	}()
+	return p
+}
+
+func (p *derpProxy) port() int { return p.ln.Addr().(*net.TCPAddr).Port }
+
+// silenceAll silences every connection carried so far and returns them.
+func (p *derpProxy) silenceAll() []*proxiedConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.conns {
+		c.silent.Store(true)
+	}
+	return append([]*proxiedConn(nil), p.conns...)
+}
+
+// numClosed reports how many of conns their DERP client has closed.
+func numClosed(conns []*proxiedConn) int {
+	n := 0
+	for _, c := range conns {
+		select {
+		case <-c.closed:
+			n++
+		default:
+		}
+	}
+	return n
+}
+
+func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(d); !cond(); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting until %s", d, what)
+		}
+	}
+}
+
+// TestNetworkChanged checks that NetworkChanged leaves DERP connections
+// that still answer alone, and replaces ones that went silent, each side
+// its own.
+func TestNetworkChanged(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	node := dm.Regions[1].Nodes[0]
+	proxy := newDERPProxy(t, net.JoinHostPort(node.HostName, strconv.Itoa(node.DERPPort)))
+	node.DERPPort = proxy.port()
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: dm.Regions[1]}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	waitUntil(t, 10*time.Second, "both sides connect to DERP", func() bool { return proxy.accepted.Load() >= 2 })
+
+	// Connections that answer stay.
+	live := proxy.silenceAll()
+	for _, pc := range live {
+		pc.silent.Store(false)
+	}
+	s.NetworkChanged()
+	c.NetworkChanged()
+	time.Sleep(4 * time.Second) // longer than the check's ping timeout
+	if n := numClosed(live); n != 0 {
+		t.Fatalf("NetworkChanged closed %d DERP connections that still answered", n)
+	}
+
+	// Silent ones are replaced, each by its own side's call.
+	silenced := proxy.silenceAll()
+	before := proxy.accepted.Load()
+	c.NetworkChanged()
+	waitUntil(t, 15*time.Second, "the client replaces its silent DERP connection", func() bool {
+		return numClosed(silenced) >= 1 && proxy.accepted.Load() > before
+	})
+	if n := numClosed(silenced); n != 1 {
+		t.Fatalf("the client's NetworkChanged closed %d silent DERP connections; want 1, its own", n)
+	}
+	s.NetworkChanged()
+	waitUntil(t, 15*time.Second, "the server replaces its silent DERP connection", func() bool {
+		return numClosed(silenced) >= 2 && proxy.accepted.Load() > before+1
+	})
 }

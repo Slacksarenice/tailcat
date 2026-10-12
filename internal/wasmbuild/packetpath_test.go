@@ -61,7 +61,7 @@ func TestPacketPathModfile(t *testing.T) {
 	}{
 		// The browser build is what uses the patch; ./web is js-only.
 		{[]string{"GOOS=js", "GOARCH=wasm"}, []string{"vet", "-tags", PacketPathTag, "-modfile", modfile, ".", "./web"}},
-		{nil, []string{"test", "-count=1", "-tags", PacketPathTag, "-modfile", modfile, "-run", "PacketPath", "."}},
+		{nil, []string{"test", "-count=1", "-tags", PacketPathTag, "-modfile", modfile, "-run", "PacketPath|NetworkChanged", "."}},
 	} {
 		args := step.args
 		cmd := goCommand(step.env, args...)
