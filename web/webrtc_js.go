@@ -760,6 +760,15 @@ func (s *rtcSession) attachControl(ctl js.Value) {
 	s.ctl = ctl
 	s.mu.Unlock()
 	s.on(ctl, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	opened := func() {
+		if s.hooks.Truthy() {
+			s.hooks.Set("ctlOpen", true)
+		}
+	}
+	s.on(ctl, "onopen", func(js.Value) { opened() })
+	if isOpen(ctl) {
+		opened()
+	}
 	s.on(ctl, "onclose", func(js.Value) {
 		s.mu.Lock()
 		if s.ctl.Equal(ctl) {
