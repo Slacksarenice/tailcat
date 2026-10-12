@@ -50,9 +50,10 @@ run-name: "${{ (inputs.pr || github.event.pull_request.number) && format('Codex 
 #   week keeps it well inside the 8-day window even if one run is missed.
 #   GitHub turns a public repository's schedules off after 60 days without
 #   activity; turn it back on from the Actions tab if that happens.
-# - This repository is public, and so are its run logs: what Codex prints
-#   while it reviews is public, like the code it reads. The credentials are
-#   masked in the logs and kept out of the review (see Leak surface).
+# - This repository is public, and so are its run logs. What Codex prints
+#   goes to a file on the runner, not the log, which says only whether it
+#   succeeded. The credentials are masked in the log and kept out of the
+#   review (see Leak surface).
 #
 # Settings: an Actions variable changes a setting with no commit; without one,
 # the default here applies:
