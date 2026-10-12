@@ -64,7 +64,10 @@ func main() {
 //	  webrtc: bool | {iceServers: [...]}, // optional; answer WebRTC upgrades from
 //	                           // web clients that enable it. iceServers defaults to
 //	                           // the DERP region's STUN servers.
-//	  onPathChange: ({peerKey, path}) => {}, // optional; path is "webrtc" or "derp"
+//	  onPathChange: ({peerKey, path}) => {}, // optional; path is "webrtc" or "derp",
+//	                           // reported each time traffic moves between them
+//	  onPathStats: (stats) => {}, // optional; a WebRTC path's stats every 2s
+//	                           // (see pathStats in webrtc_js.go)
 //	}
 //
 // It returns a Promise that resolves to:
@@ -200,7 +203,8 @@ func tailcatListen(this js.Value, args []js.Value) any {
 //	  webrtc: bool | {iceServers: [...]}, // optional; upgrade to a direct WebRTC path
 //	                      // if the server is this web app with WebRTC enabled.
 //	                      // Leave it off for native tailcat servers.
-//	  onPathChange: ({peerKey, path}) => {}, // optional; path is "webrtc" or "derp"
+//	  onPathChange: ({peerKey, path}) => {}, // optional; as for tailcatListen
+//	  onPathStats: (stats) => {},            // optional; as for tailcatListen
 //	}
 //
 // It returns a Promise that resolves to a conn object (see makeJSConn)

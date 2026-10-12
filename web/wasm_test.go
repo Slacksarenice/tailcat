@@ -1064,21 +1064,75 @@ func (p *tabPair) eachTab(name string, timeout time.Duration, actions ...chromed
 	p.step(p.send, "sender: "+name, timeout, actions...)
 }
 
-// checkOnlyWebRTC checks that neither tab ever reported its path down.
-func (p *tabPair) checkOnlyWebRTC() {
+// checkSameSession checks that each tab's traffic is back on the WebRTC
+// path it first qualified, the session never having ended: its reports
+// alternate between "webrtc" and "derp" (traffic moving off a quiet path
+// and back), ending on "webrtc", and the path qualified only once.
+func (p *tabPair) checkSameSession() {
 	p.t.Helper()
 	for _, tab := range []struct {
 		name string
 		ctx  context.Context
 	}{{"listener", p.listen}, {"sender", p.send}} {
-		var paths string
+		var paths []string
+		var qualified int
 		p.step(tab.ctx, tab.name+": reading the paths reported", 10*time.Second,
-			chromedp.Evaluate(`JSON.stringify(window.tcTest.paths)`, &paths),
+			chromedp.Evaluate(`window.tcTest.paths`, &paths),
+			chromedp.Evaluate(`window.tailcatTestHooks.qualified`, &qualified),
 		)
-		if paths != `["webrtc"]` {
-			p.t.Errorf("%s tab reported paths %s; want only [\"webrtc\"]", tab.name, paths)
+		ok := len(paths) > 0 && paths[len(paths)-1] == "webrtc"
+		for i, path := range paths {
+			want := "webrtc"
+			if i%2 == 1 {
+				want = "derp"
+			}
+			ok = ok && path == want
+		}
+		if !ok || qualified != 1 {
+			p.t.Errorf("%s tab reported paths %q and qualified %d times; want webrtc/derp alternating, ending on webrtc, from one qualification",
+				tab.name, paths, qualified)
 		}
 	}
+}
+
+// checkDataOnly checks that each tab's last local description offered
+// or answered a data channel and no media.
+func (p *tabPair) checkDataOnly() {
+	p.t.Helper()
+	for _, tab := range []struct {
+		name string
+		ctx  context.Context
+	}{{"listener", p.listen}, {"sender", p.send}} {
+		var sdp string
+		p.step(tab.ctx, tab.name+": reading the local description", 10*time.Second,
+			chromedp.Evaluate(`String(window.tailcatTestHooks.localSDP)`, &sdp),
+		)
+		var media []string
+		for _, line := range strings.Split(sdp, "\n") {
+			if strings.HasPrefix(line, "m=") {
+				media = append(media, strings.Fields(line)[0])
+			}
+		}
+		if len(media) != 1 || media[0] != "m=application" {
+			p.t.Errorf("%s tab's local description has media sections %q; want only m=application", tab.name, media)
+		}
+	}
+}
+
+// TestBrowserWebRTCDataOnly checks that the session the tabs negotiate
+// carries one data section and no audio or video, and that the page
+// hears the path's stats: a measured round trip and the candidate pair.
+func TestBrowserWebRTCDataOnly(t *testing.T) {
+	p := newTabPair(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+	p.webrtcTabs(srv, transferSize)
+	p.checkDataOnly()
+	p.eachTab("path stats", 10*time.Second,
+		poll(`window.tcTest.stats && window.tcTest.stats.path === "webrtc" && window.tcTest.stats.rttMs > 0 && window.tcTest.stats.local === "host"`),
+	)
+	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
+	p.checkTransfer()
 }
 
 // TestBrowserWebRTCOutage cuts the direct WebRTC path between two tabs
@@ -1102,7 +1156,7 @@ func TestBrowserWebRTCOutage(t *testing.T) {
 	)
 	t.Logf("the dialer restarted ICE %v after the cut", time.Since(cut).Round(time.Millisecond))
 	p.restorePath(cut)
-	p.checkOnlyWebRTC()
+	p.checkSameSession()
 
 	cut = p.cutPath()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
@@ -1160,7 +1214,7 @@ func TestBrowserWebRTCNetworkChange(t *testing.T) {
 		poll(`window.tailcatTestHooks.netChecks >= 1`),
 	)
 	p.eachTab("path healthy after the change", 10*time.Second, poll(`window.tailcatTestHooks.state === "healthy"`))
-	p.checkOnlyWebRTC()
+	p.checkSameSession()
 
 	t.Logf("both tabs kept their WebRTC path through the change; stopping DERP")
 	stopDERP()

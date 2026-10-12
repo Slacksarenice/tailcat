@@ -21,6 +21,7 @@ window.tcTest = {
   sendDone: false,
   path: null, // "webrtc" or "derp" once reported
   paths: [],  // every path reported, in order
+  stats: null, // the last onPathStats report
   go: false,  // with ?gate, the sender waits for the test to set this
   errors: [],
 };
@@ -58,6 +59,18 @@ function onPathChange({ peerKey, path }) {
   if (verbose) {
     console.log(`path to ${peerKey}: ${path}`);
   }
+}
+
+// onPathStats shows the direct path's round trip and candidate types
+// while it carries the traffic.
+function onPathStats(stats) {
+  window.tcTest.stats = stats;
+  if (stats.path !== "webrtc") {
+    return;
+  }
+  const route = stats.local && stats.remote ? ` ${stats.local} ↔ ${stats.remote}` : "";
+  document.getElementById("path").textContent =
+    `· direct (WebRTC${route}, ${stats.rttMs < 1 ? "<1" : Math.round(stats.rttMs)} ms)`;
 }
 
 // canonicalDERPMapURL is the public tailcat DERP map, which allows
@@ -178,7 +191,7 @@ async function startListener() {
   try {
     const ln = await tailcatListen({
       derpMapURL, privateKey, verbose, onConnection,
-      webrtc: webrtcOption(), onPathChange,
+      webrtc: webrtcOption(), onPathChange, onPathStats,
     });
     if (persist) {
       localStorage.setItem(KEY_STORAGE, ln.privateKeyJSON);
@@ -311,7 +324,7 @@ async function until(cond) {
 async function sendStream(addr, size, readChunk, progressEl) {
   const conn = await tailcatDial({
     addr, derpMapURL, verbose,
-    webrtc: webrtcOption(), onPathChange,
+    webrtc: webrtcOption(), onPathChange, onPathStats,
   });
   // Test hooks: ?waitpath=webrtc holds the data until the direct path
   // is up, and ?gate until the test sets tcTest.go (after stopping the

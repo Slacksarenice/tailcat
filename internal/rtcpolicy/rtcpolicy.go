@@ -12,6 +12,7 @@ package rtcpolicy
 import (
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,13 +54,29 @@ type Liveness struct {
 	// SuspectAfter is how long the oldest unanswered ping may wait
 	// before the path is Suspect, RestartAfter before it is reported as
 	// Restart, and DeadAfter before it is Dead.
+	//
+	// If MaxSuspectAfter is set, SuspectAfter is only the wait used
+	// until a round trip has been measured: from then on it is six
+	// smoothed round trips plus a second, held between MinSuspectAfter
+	// and MaxSuspectAfter, so a slow path isn't judged by a fast one's
+	// clock, nor a fast one left unwatched. RestartAfter is then at
+	// least two seconds past it.
 	SuspectAfter, RestartAfter, DeadAfter time.Duration
+	MinSuspectAfter, MaxSuspectAfter      time.Duration
 	// MaxTickGap is the longest expected gap between Tick calls. A
 	// longer one means this side's timers were held back (a hidden
 	// tab's are throttled), so the time in between isn't held against
 	// the peer: the wait starts over, from a fresh ping, with the path
 	// Suspect until that is answered.
 	MaxTickGap time.Duration
+	// MinHold and MaxHold bound how long a path that went Suspect again
+	// within StableFor of recovering must keep answering before traffic
+	// returns to it: the hold starts at MinHold and doubles with each
+	// such relapse, and a path that stays healthy for StableFor drops
+	// it. A path that flaps (a congested uplink, a link that comes and
+	// goes) then settles on the relay instead of dragging the tunnel's
+	// traffic back and forth. Zero MaxHold disables the hold.
+	MinHold, MaxHold, StableFor time.Duration
 
 	seq       uint32
 	waitSeq   uint32    // the ping that started the current wait
@@ -67,32 +84,72 @@ type Liveness struct {
 	lastTick  time.Time
 	suspect   bool
 	restarted bool // Restart was reported in the current outage
+
+	sentSeq   uint32    // the last ping Tick asked for
+	sentAt    time.Time // and when
+	srtt      time.Duration
+	lastHeard time.Time // when traffic last arrived over the path
+
+	hold          time.Duration // the hold the next recovery waits out
+	recoverAt     time.Time     // a recovery waiting out its hold, if non-zero
+	lastRecovered time.Time
 }
 
+// suspectAfter is how long the oldest unanswered ping may wait before
+// the path is Suspect.
+func (l *Liveness) suspectAfter() time.Duration {
+	if l.MaxSuspectAfter == 0 || l.srtt == 0 {
+		return l.SuspectAfter
+	}
+	return min(max(6*l.srtt+time.Second, l.MinSuspectAfter), l.MaxSuspectAfter)
+}
+
+func (l *Liveness) restartAfter() time.Duration {
+	return max(l.RestartAfter, l.suspectAfter()+2*time.Second)
+}
+
+// RTT returns the smoothed round trip of the path's pings, or zero if
+// none has been measured.
+func (l *Liveness) RTT() time.Duration { return l.srtt }
+
 // Tick is called at each ping interval. It returns the path's state and
-// the sequence number of the ping to send now.
+// the sequence number of the ping to send now. It returns Healthy for a
+// Suspect path whose recovery has waited out its hold; the caller sees
+// the change from Suspect.
 func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	l.seq++
 	seq := l.seq
+	l.sentSeq, l.sentAt = seq, now
 	asleep := !l.lastTick.IsZero() && now.Sub(l.lastTick) > l.MaxTickGap
 	l.lastTick = now
 	if asleep {
 		l.waitStart, l.waitSeq = now, seq
-		l.suspect = true
+		l.becomeSuspect(now, false)
 		return Suspect, seq
+	}
+	if l.suspect && !l.recoverAt.IsZero() && !now.Before(l.recoverAt) {
+		l.recover(now)
 	}
 	if l.waitStart.IsZero() {
 		l.waitStart, l.waitSeq = now, seq
 	}
 	waited := now.Sub(l.waitStart)
+	if !l.suspect && l.lastHeard.After(l.waitStart) {
+		// Traffic arriving over the path shows it still works while
+		// the pings' answers are late (queued behind that traffic, say).
+		// It postpones suspicion, but can't end it: only an answer
+		// proves the way there works too.
+		waited = now.Sub(l.lastHeard)
+	}
 	switch {
 	case waited >= l.DeadAfter:
 		return Dead, seq
-	case waited >= l.RestartAfter && !l.restarted:
-		l.restarted, l.suspect = true, true
+	case waited >= l.restartAfter() && !l.restarted:
+		l.restarted = true
+		l.becomeSuspect(now, true)
 		return Restart, seq
-	case waited >= l.SuspectAfter:
-		l.suspect = true
+	case waited >= l.suspectAfter():
+		l.becomeSuspect(now, true)
 	}
 	if l.suspect {
 		return Suspect, seq
@@ -100,18 +157,66 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	return Healthy, seq
 }
 
-// Pong records the answer to ping seq. An answer to any ping sent since
-// the current wait began ends it: later pings may still be queued
-// behind data on a slow uplink. It reports whether the path was
-// Suspect, and so whether traffic may return to it.
-func (l *Liveness) Pong(seq uint32) (recovered bool) {
+// becomeSuspect marks the path Suspect, cancelling any recovery waiting
+// out its hold. relapse is false when the cause is this side's own
+// (throttled timers): that isn't held against the path.
+func (l *Liveness) becomeSuspect(now time.Time, relapse bool) {
+	l.recoverAt = time.Time{}
+	if l.suspect {
+		return
+	}
+	l.suspect = true
+	if !relapse || l.MaxHold == 0 {
+		return
+	}
+	if !l.lastRecovered.IsZero() && now.Sub(l.lastRecovered) < l.StableFor {
+		l.hold = min(max(2*l.hold, l.MinHold), l.MaxHold)
+	} else {
+		l.hold = 0
+	}
+}
+
+func (l *Liveness) recover(now time.Time) {
+	l.suspect, l.restarted = false, false
+	l.recoverAt = time.Time{}
+	l.lastRecovered = now
+}
+
+// Heard records traffic arriving over the path now (see Tick).
+func (l *Liveness) Heard(now time.Time) { l.lastHeard = now }
+
+// Pong records the answer to ping seq, received now. An answer to any
+// ping sent since the current wait began ends it: later pings may still
+// be queued behind data on a slow uplink. It reports whether the path
+// was Suspect and traffic may return to it now; a path that relapsed
+// soon after its last recovery returns only once Tick finds it has kept
+// answering for its hold.
+func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
+	if seq == l.sentSeq && !l.sentAt.IsZero() {
+		if rtt := now.Sub(l.sentAt); rtt >= 0 {
+			if l.srtt == 0 {
+				l.srtt = rtt
+			} else {
+				l.srtt = (7*l.srtt + rtt) / 8
+			}
+		}
+		l.sentAt = time.Time{}
+	}
 	if l.waitStart.IsZero() || int32(seq-l.waitSeq) < 0 {
 		return false
 	}
 	l.waitStart = time.Time{}
-	recovered = l.suspect
-	l.suspect, l.restarted = false, false
-	return recovered
+	if !l.suspect {
+		return false
+	}
+	if l.hold > 0 {
+		if l.recoverAt.IsZero() {
+			l.recoverAt = now.Add(l.hold)
+		}
+		return false
+	}
+	l.recover(now)
+	return true
 }
 
 // MarkSuspect makes the path Suspect at once, as when ICE reports it
@@ -120,7 +225,7 @@ func (l *Liveness) Pong(seq uint32) (recovered bool) {
 // earlier one may have left the peer before the path broke. A wait
 // already under way keeps its start, and so its deadlines.
 func (l *Liveness) MarkSuspect(now time.Time) {
-	l.suspect = true
+	l.becomeSuspect(now, true)
 	l.waitSeq = l.seq + 1 // the next ping's
 	if l.waitStart.IsZero() {
 		l.waitStart = now
@@ -202,6 +307,29 @@ func (b *Backoff) Next(up bool, lasted time.Duration) time.Duration {
 // Reset makes the next wait the shortest, as after a network change,
 // when an attempt that failed before may now succeed.
 func (b *Backoff) Reset() { b.next = 0 }
+
+// CheckDataOnly reports an error unless sdp describes a data channel
+// session and nothing else: exactly one media section, and that an
+// "application" one. The tunnel carries only datagrams, so a
+// description that asks for audio or video (or anything a browser might
+// add later) is refused rather than negotiated.
+func CheckDataOnly(sdp string) error {
+	n := 0
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "m=") {
+			continue
+		}
+		n++
+		if !strings.HasPrefix(line, "m=application ") {
+			return errors.New("description has a non-data media section: " + strings.Fields(line)[0])
+		}
+	}
+	if n != 1 {
+		return errors.New("description has " + strconv.Itoa(n) + " media sections; want one data section")
+	}
+	return nil
+}
 
 // SignalFailure is what a failed attempt to open a signaling stream says
 // about the server.
