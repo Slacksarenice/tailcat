@@ -1151,7 +1151,11 @@ func (s *rtcSession) watch() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case now := <-t.C:
+		case <-t.C:
+			// Not the tick's own time, which is when it was due: a tick
+			// the browser held back would then hide the gap from Tick and
+			// date this ping's round trip from before it was sent.
+			now := time.Now()
 			s.mu.Lock()
 			wasSuspect := s.live.Suspect()
 			st, seq := s.live.Tick(now)
