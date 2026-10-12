@@ -146,6 +146,28 @@ func TestLivenessMarkSuspect(t *testing.T) {
 	}
 }
 
+// TestLivenessMarkSuspectOutstanding: a ping still unanswered when the
+// path is marked Suspect can't end the suspicion, however late its
+// answer comes, but the wait it started keeps its deadlines.
+func TestLivenessMarkSuspectOutstanding(t *testing.T) {
+	l := newLiveness()
+	_, old := l.Tick(at(0)) // unanswered: the wait starts at 0s
+	l.MarkSuspect(at(1))
+	if l.Pong(old) {
+		t.Errorf("an answer to a ping sent before MarkSuspect ended the suspicion")
+	}
+	l.Tick(at(2))
+	l.Tick(at(4))
+	if st, _ := l.Tick(at(6)); st != Restart {
+		t.Errorf("at 6s: %v; want Restart, 6s after the wait began at 0s", st)
+	}
+	l.MarkSuspect(at(7))
+	seq := l.NextSeq()
+	if !l.Pong(seq) {
+		t.Errorf("the answer to a ping sent after MarkSuspect didn't end the suspicion")
+	}
+}
+
 // TestLivenessNextSeq: after MarkSuspect, the answer to a ping sent at
 // once, between ticks, ends the suspicion; one to an earlier ping
 // doesn't.
@@ -181,6 +203,32 @@ func TestLivenessTakeRestart(t *testing.T) {
 	l.Tick(at(4))
 	if st, _ := l.Tick(at(6)); st != Suspect {
 		t.Errorf("at 6s after TakeRestart: %v; want Suspect, the restart already taken", st)
+	}
+}
+
+// TestLivenessRestarted: a restart begun for a reason of its own uses up
+// the outage's restart, until an answer ends the outage.
+func TestLivenessRestarted(t *testing.T) {
+	l := newLiveness()
+	l.Tick(at(0))
+	l.Restarted(at(1))
+	if !l.Suspect() {
+		t.Fatalf("not Suspect after Restarted")
+	}
+	if l.TakeRestart(at(2)) {
+		t.Errorf("TakeRestart allowed a second restart in the outage")
+	}
+	l.Tick(at(2))
+	l.Tick(at(4))
+	if st, _ := l.Tick(at(6)); st != Suspect {
+		t.Errorf("at 6s: %v; want Suspect, the restart already used", st)
+	}
+	_, seq := l.Tick(at(8))
+	if !l.Pong(seq) {
+		t.Fatalf("the answer didn't end the outage")
+	}
+	if !l.TakeRestart(at(9)) {
+		t.Errorf("the next outage didn't get a restart of its own")
 	}
 }
 

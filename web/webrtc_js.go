@@ -298,7 +298,8 @@ type rtcSession struct {
 	qualified     bool
 	probeAcks     int
 	live          rtcpolicy.Liveness
-	restarting    bool // an ICE restart's offer is being made
+	restarting    bool   // an ICE restart's offer is being made
+	restartAgain  string // why to restart ICE again once the offer under way is answered
 	remoteSet     bool
 	pendingCands  []json.RawMessage
 	holdCands     bool        // a local description is being made; hold its candidates
@@ -307,6 +308,7 @@ type rtcSession struct {
 	sendBuf       js.Value // reusable Uint8Array for outgoing frames
 	recvScratch   []byte   // used only by onMessage, a JS callback
 	everQualified bool
+	qualifiedAt   time.Time
 }
 
 func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic, signal net.Conn, iceServers js.Value, notify pathNotifier,
@@ -380,14 +382,25 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			s.setHookState()
 			return
 		case st == "failed" && up:
-			restart := s.offerer && s.live.TakeRestart(time.Now())
+			now := time.Now()
+			restart, offerOut := false, false
+			if s.offerer {
+				restart = s.live.TakeRestart(now)
+				offerOut = s.offerOutLocked()
+			} else {
+				s.live.MarkSuspect(now)
+			}
 			s.mu.Unlock()
 			s.setHookState()
 			switch {
 			case restart:
-				go s.restartICE("ICE failed")
+				go s.restartICE("ICE failed", false)
 			case !s.offerer:
 				// The dialer restarts ICE; if the path stays silent,
+				// the pings end the session.
+			case offerOut:
+				// The failure may be the old network's, under the
+				// restart's offer; if that doesn't bring the path back,
 				// the pings end the session.
 			default:
 				s.logf("webrtc: peer connection failed again after an ICE restart")
@@ -506,6 +519,13 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 			return s.describe()
 		}
 		s.countHook("answers")
+		s.mu.Lock()
+		again := s.restartAgain
+		s.restartAgain = ""
+		s.mu.Unlock()
+		if again != "" {
+			go s.restartICE(again, false)
+		}
 		return nil
 	case m.T == "cand":
 		s.mu.Lock()
@@ -773,6 +793,7 @@ func (s *rtcSession) qualify() {
 	}
 	s.qualified = true
 	s.everQualified = true
+	s.qualifiedAt = time.Now()
 	s.mu.Unlock()
 	s.logf("webrtc: direct path to %v up", s.peer.ShortString())
 	s.notify(s.peer, "webrtc")
@@ -820,7 +841,7 @@ func (s *rtcSession) watch() {
 				return
 			case rtcpolicy.Restart:
 				if s.offerer {
-					go s.restartICE("pings unanswered")
+					go s.restartICE("pings unanswered", false)
 				}
 			}
 			if !wasSuspect && st != rtcpolicy.Healthy {
@@ -835,11 +856,19 @@ func (s *rtcSession) watch() {
 // restartICE makes a new offer that restarts ICE on the session's
 // connection, keeping its DataChannel, as after the network changed
 // under it. Only the offerer calls it; the answerer answers the new
-// offer like the first. It does nothing while another offer is under
-// way.
-func (s *rtcSession) restartICE(why string) {
+// offer like the first. While another offer is under way it does
+// nothing, unless renew is set, as for a network change: that offer's
+// candidates may be the old network's, so ICE restarts again once it is
+// answered.
+func (s *rtcSession) restartICE(why string, renew bool) {
+	if !s.offerer {
+		return
+	}
 	s.mu.Lock()
-	if s.restarting || !s.offerer {
+	if s.offerOutLocked() {
+		if renew {
+			s.restartAgain = why
+		}
 		s.mu.Unlock()
 		return
 	}
@@ -850,7 +879,7 @@ func (s *rtcSession) restartICE(why string) {
 		s.restarting = false
 		s.mu.Unlock()
 	}()
-	if s.ctx.Err() != nil || s.pc.Get("signalingState").String() != "stable" {
+	if s.ctx.Err() != nil {
 		return
 	}
 	s.logf("webrtc: restarting ICE to %v (%s)", s.peer.ShortString(), why)
@@ -872,18 +901,31 @@ func (s *rtcSession) restartICE(why string) {
 	}
 }
 
+// offerOutLocked reports whether an offer of this side's is under way:
+// being made, or waiting for its answer.
+func (s *rtcSession) offerOutLocked() bool {
+	return s.restarting || s.pc.Get("signalingState").String() != "stable"
+}
+
 // networkChanged checks the session's path at once, as the browser
 // reported a network change that may have broken it: traffic goes over
 // DERP until a ping sent now is answered, and the offerer restarts ICE,
 // which finds a path over the new network sooner than the pings would
-// notice the old one gone. It reports false if the session has no path
-// to check: it is still negotiating, over the old network.
+// notice the old one gone. That restart is the outage's, so the pings
+// don't start another over it. It reports false if the session has no
+// path to check: it is still negotiating, over the old network, or it is
+// ending.
 func (s *rtcSession) networkChanged() bool {
+	now := time.Now()
 	s.mu.Lock()
-	up := s.qualified
+	up := s.qualified && s.ctx.Err() == nil
 	var seq uint32
 	if up {
-		s.live.MarkSuspect(time.Now())
+		if s.offerer {
+			s.live.Restarted(now)
+		} else {
+			s.live.MarkSuspect(now)
+		}
 		seq = s.live.NextSeq()
 	}
 	s.mu.Unlock()
@@ -894,7 +936,7 @@ func (s *rtcSession) networkChanged() bool {
 	s.setHookState()
 	s.sendControl(framePing, seq, 0)
 	if s.offerer {
-		s.restartICE("network changed")
+		s.restartICE("network changed", true)
 	}
 	return true
 }
@@ -1118,7 +1160,9 @@ func (r *rtcServer) disconnect(peer key.NodePublic) {
 
 func (r *rtcServer) close() { r.cancel() }
 
-// networkChanged passes a network change on to every session.
+// networkChanged passes a network change on to every session. One still
+// negotiating, over the old network, ends, and its client negotiates
+// again.
 func (r *rtcServer) networkChanged() {
 	r.mu.Lock()
 	sessions := make([]*rtcSession, 0, len(r.sessions))
@@ -1127,7 +1171,11 @@ func (r *rtcServer) networkChanged() {
 	}
 	r.mu.Unlock()
 	for _, s := range sessions {
-		go s.networkChanged()
+		go func() {
+			if !s.networkChanged() {
+				s.close()
+			}
+		}()
 	}
 }
 
@@ -1273,17 +1321,23 @@ type rtcClient struct {
 	hooks  js.Value      // the page's tailcatTestHooks object, if it has one
 	wake   chan struct{} // a network change: negotiate now
 
-	mu  sync.Mutex
-	cur *rtcSession // the session under way, if any
+	mu    sync.Mutex
+	cur   *rtcSession        // the session under way, if any
+	abort context.CancelFunc // ends the attempt under way, if any
 }
 
 // rtcAttempt is how one attempt at a session went.
 type rtcAttempt struct {
 	answered bool                    // the server completed the preamble
 	up       bool                    // the session's path carried traffic
+	lasted   time.Duration           // if up, for how long, from when it came up
 	failure  rtcpolicy.SignalFailure // if it didn't answer, how
 	err      error
 }
+
+// errNetChanged means a network change ended an attempt before its
+// session was under way, as it was negotiating over the old network.
+var errNetChanged = errors.New("network changed during signaling; starting over")
 
 // runRTCClient keeps a WebRTC session to cl's server for as long as ctx
 // lasts, negotiating a new one when one ends, with backoff, unless the
@@ -1320,7 +1374,6 @@ func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf l
 	answered, dropped := false, 0
 	for {
 		c.setHookState("negotiating")
-		start := time.Now()
 		a := c.attempt(ctx)
 		if ctx.Err() != nil {
 			return
@@ -1348,7 +1401,7 @@ func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf l
 		if a.err != nil {
 			logf("webrtc: %v", a.err)
 		}
-		wait := backoff.Next(a.up, time.Since(start))
+		wait := backoff.Next(a.up, a.lasted)
 		c.setHookState("waiting")
 		select {
 		case <-ctx.Done():
@@ -1360,12 +1413,31 @@ func runRTCClient(ctx context.Context, cl *tailcat.Client, opts js.Value, logf l
 	}
 }
 
-// attempt runs one session to the server until it ends.
+// attempt runs one session to the server until it ends. A network
+// change before the session has a path ends it (see networkChanged):
+// signaling and ICE under way are the old network's.
 func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
-	dctx, cancel := context.WithTimeout(ctx, signalTimeout)
+	actx, abort := context.WithCancel(ctx)
+	defer abort()
+	c.mu.Lock()
+	c.abort = abort
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.cur, c.abort = nil, nil
+		c.mu.Unlock()
+	}()
+	// A network change, rather than the server, ended the signaling:
+	// that says nothing of the server.
+	netChanged := func() bool { return actx.Err() != nil && ctx.Err() == nil }
+
+	dctx, cancel := context.WithTimeout(actx, signalTimeout)
 	conn, err := c.cl.DialTCPPort(dctx, webrtcSignalPort)
 	cancel()
 	if err != nil {
+		if netChanged() {
+			return rtcAttempt{err: errNetChanged}
+		}
 		f := rtcpolicy.ClassifyDial(err)
 		return rtcAttempt{failure: f, err: fmt.Errorf("%w (dialing signaling port, %v: %v)", errNoSignaling, f, err)}
 	}
@@ -1373,6 +1445,7 @@ func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
 	// it drops the stream (it is pacing its sessions, say). No reply at
 	// all means it isn't one (a native tailcat server piping connections
 	// to its output, say), and so does any other reply.
+	stopAbort := context.AfterFunc(actx, func() { conn.Close() })
 	conn.SetDeadline(time.Now().Add(signalTimeout))
 	br := bufio.NewReader(conn)
 	_, err = io.WriteString(conn, signalPreamble)
@@ -1382,6 +1455,9 @@ func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
 	}
 	if err != nil {
 		conn.Close()
+		if netChanged() {
+			return rtcAttempt{err: errNetChanged}
+		}
 		f := rtcpolicy.ClassifyPreamble(err)
 		return rtcAttempt{failure: f, err: fmt.Errorf("%w (preamble, %v: %v)", errNoSignaling, f, err)}
 	}
@@ -1389,9 +1465,16 @@ func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
 		conn.Close()
 		return rtcAttempt{err: errNoWebRTCPeer}
 	}
+	if !stopAbort() {
+		// The network changed just as the server answered, and the
+		// stream is closed.
+		return rtcAttempt{answered: true, err: errNetChanged}
+	}
 	conn.SetDeadline(time.Time{})
 
-	sess, err := newRTCSession(ctx, c.logf, c.peer, conn, c.opts.iceServersFor(c.cl.DERPRegion()), c.notify, c.cl.NewPacketPath, true)
+	// The session lives in actx, so a network change before it has a
+	// path ends it too.
+	sess, err := newRTCSession(actx, c.logf, c.peer, conn, c.opts.iceServersFor(c.cl.DERPRegion()), c.notify, c.cl.NewPacketPath, true)
 	if err != nil {
 		conn.Close()
 		return rtcAttempt{answered: true, err: err}
@@ -1399,11 +1482,6 @@ func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
 	c.mu.Lock()
 	c.cur = sess
 	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		c.cur = nil
-		c.mu.Unlock()
-	}()
 	if err := sess.offer(); err != nil {
 		sess.close()
 		return rtcAttempt{answered: true, err: fmt.Errorf("offer: %w", err)}
@@ -1412,19 +1490,22 @@ func (c *rtcClient) attempt(ctx context.Context) rtcAttempt {
 	go sess.giveUpUnlessQualified()
 	<-sess.ctx.Done()
 	sess.mu.Lock()
-	up := sess.everQualified
+	a := rtcAttempt{answered: true, up: sess.everQualified}
+	if a.up {
+		a.lasted = time.Since(sess.qualifiedAt)
+	}
 	sess.mu.Unlock()
-	return rtcAttempt{answered: true, up: up}
+	return a
 }
 
 // networkChanged passes a network change on: the tunnel checks its DERP
-// connection, and the session's path is checked at once. A session
-// still negotiating, over the old network, starts over, and between
-// sessions the next starts now.
+// connection, and the session's path is checked at once. An attempt
+// that has no path yet, still signaling or negotiating over the old
+// network, starts over now, and between attempts the next starts now.
 func (c *rtcClient) networkChanged() {
 	c.cl.NetworkChanged()
 	c.mu.Lock()
-	sess := c.cur
+	sess, abort := c.cur, c.abort
 	c.mu.Unlock()
 	if sess != nil && sess.networkChanged() {
 		return
@@ -1433,8 +1514,8 @@ func (c *rtcClient) networkChanged() {
 	case c.wake <- struct{}{}:
 	default:
 	}
-	if sess != nil {
-		sess.close()
+	if abort != nil {
+		abort()
 	}
 }
 

@@ -116,10 +116,14 @@ func (l *Liveness) Pong(seq uint32) (recovered bool) {
 
 // MarkSuspect makes the path Suspect at once, as when ICE reports it
 // disconnected, and starts the wait for an answer if none is under way.
+// Only a ping sent from now on can end the suspicion: the answer to an
+// earlier one may have left the peer before the path broke. A wait
+// already under way keeps its start, and so its deadlines.
 func (l *Liveness) MarkSuspect(now time.Time) {
 	l.suspect = true
+	l.waitSeq = l.seq + 1 // the next ping's
 	if l.waitStart.IsZero() {
-		l.waitStart, l.waitSeq = now, l.seq+1 // the next ping's
+		l.waitStart = now
 	}
 }
 
@@ -143,6 +147,15 @@ func (l *Liveness) TakeRestart(now time.Time) bool {
 	return true
 }
 
+// Restarted records a restart begun now for a reason of its own, as a
+// network change: it marks the path Suspect and uses up the current
+// outage's restart, so neither Tick nor TakeRestart starts another on
+// top of it.
+func (l *Liveness) Restarted(now time.Time) {
+	l.MarkSuspect(now)
+	l.restarted = true
+}
+
 // Suspect reports whether traffic should stay off the path.
 func (l *Liveness) Suspect() bool { return l.suspect }
 
@@ -154,9 +167,10 @@ type Backoff struct {
 	// two networks can reach each other, so a lost path is worth
 	// winning back sooner).
 	Min, Max, MaxAfterUp time.Duration
-	// HealthyFor is how long a session that carried traffic must have
-	// lasted for the next wait to start over from Min. A path that
-	// keeps failing soon after it comes up keeps backing off.
+	// HealthyFor is how long a path that carried traffic must have
+	// lasted, from when it came up, for the next wait to start over from
+	// Min. A path that keeps failing soon after it comes up keeps backing
+	// off, however long its negotiation took.
 	HealthyFor time.Duration
 
 	next   time.Duration
@@ -165,7 +179,7 @@ type Backoff struct {
 
 // Next returns how long to wait before the next attempt, given how the
 // last one went: up reports whether its path carried traffic, and
-// lasted how long its session ran.
+// lasted how long, from when it came up to when its session ended.
 func (b *Backoff) Next(up bool, lasted time.Duration) time.Duration {
 	ceiling := b.Max
 	if up {
