@@ -125,14 +125,18 @@ const (
 	// minPeerRestartGap paces the ICE restarts the answerer asks for.
 	minPeerRestartGap = 5 * time.Second
 
-	// Above softBuffered bytes waiting in the DataChannel, one datagram
-	// is dropped every shedEvery, which inner TCP answers by halving its
-	// window; above hardBuffered, every datagram is (see
-	// rtcpolicy.Shedder). hardBuffered is above the 6 MiB a tailscale
-	// netstack TCP connection can have in flight, and well under the
-	// 16 MiB at which Chrome closes a channel. Pings travel on the
-	// control channel, so they don't wait behind the datagrams.
-	softBuffered = 256 << 10
+	// Above shedTarget of queue in the DataChannel, at the rate it is
+	// measured draining (within minBuffered and hardBuffered bytes, and
+	// initBuffered until measured), one datagram is dropped every
+	// shedEvery, which inner TCP answers by halving its window; above
+	// hardBuffered, every datagram is (see rtcpolicy.Shedder).
+	// hardBuffered is above the 6 MiB a tailscale netstack TCP
+	// connection can have in flight, and well under the 16 MiB at which
+	// Chrome closes a channel. Pings travel on the control channel, so
+	// they don't wait behind the datagrams.
+	shedTarget   = 20 * time.Millisecond
+	minBuffered  = 64 << 10
+	initBuffered = 256 << 10
 	hardBuffered = 8 << 20
 	shedEvery    = 100 * time.Millisecond
 	maxFrame     = frameHeaderLen + 65535
@@ -440,9 +444,11 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			StableFor:       stableFor,
 		},
 		shed: rtcpolicy.Shedder{
-			SoftLimit: softBuffered,
-			HardLimit: hardBuffered,
-			Every:     shedEvery,
+			Target:       shedTarget,
+			MinLimit:     minBuffered,
+			InitialLimit: initBuffered,
+			HardLimit:    hardBuffered,
+			Every:        shedEvery,
 		},
 	}
 	pc, err := func() (pc js.Value, err error) {
@@ -898,7 +904,7 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	if !s.qualified || s.live.Suspect() || frameHeaderLen+len(pkt) > maxFrame {
 		return false
 	}
-	if s.shed.Drop(s.dc.Get("bufferedAmount").Int(), time.Now()) {
+	if s.shed.Drop(s.dc.Get("bufferedAmount").Int(), frameHeaderLen+len(pkt), time.Now()) {
 		s.dropped++
 		return true // dropped: inner TCP slows down
 	}
@@ -941,6 +947,23 @@ func (s *rtcSession) onMessage(data js.Value) {
 		s.recvBytes += int64(n - frameHeaderLen)
 		s.live.Heard(time.Now())
 		s.mu.Unlock()
+		if p != nil && s.hooks.Truthy() {
+			// A test simulating a longer path: hold each datagram
+			// delayMs before WireGuard sees it. Only the tunnel's TCP
+			// sees the longer round trip; the DataChannel's SCTP, and
+			// the pings, see the real one.
+			if d := s.hooks.Get("delayMs"); d.Type() == js.TypeNumber && d.Float() > 0 {
+				pkt := append([]byte(nil), b[frameHeaderLen:]...)
+				time.AfterFunc(time.Duration(d.Float()*float64(time.Millisecond)), func() {
+					if !p.Deliver(pkt) {
+						s.mu.Lock()
+						s.recvDropped++
+						s.mu.Unlock()
+					}
+				})
+				return
+			}
+		}
 		if p != nil && !p.Deliver(b[frameHeaderLen:]) {
 			s.mu.Lock()
 			s.recvDropped++

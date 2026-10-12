@@ -31,11 +31,12 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 
 // With ?hooks, the Go side reports its WebRTC path's state into
 // tailcatTestHooks, and the test can steer it from there (see
-// webrtc_js.go): dropRTC discards what the DataChannel receives, and
-// family ("4" or "6", from ?family) makes the page's WebRTC act as on a
-// host with only that address family.
+// webrtc_js.go): dropRTC discards what the DataChannel receives, family
+// ("4" or "6", from ?family) makes the page's WebRTC act as on a host
+// with only that address family, and delayMs (from ?delay) holds each
+// datagram received that long, for a longer round trip.
 if (params.has("hooks")) {
-  window.tailcatTestHooks = { dropRTC: false, family: params.get("family") || "" };
+  window.tailcatTestHooks = { dropRTC: false, family: params.get("family") || "", delayMs: Number(params.get("delay")) || 0 };
 }
 
 if (params.has("webrtc")) {

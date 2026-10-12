@@ -1312,6 +1312,9 @@ func (p *tabPair) restorePath(cut time.Time) {
 var stressBytes = flag.Int("web-stress-bytes", 0,
 	"run TestBrowserWebRTCStress, sending this many bytes between two browsers")
 
+var stressDelay = flag.Duration("web-stress-rtt", 0,
+	"TestBrowserWebRTCStress: add this much to the round trip of the tunnel's TCP, by holding each datagram received; the DataChannel's own round trip stays the loopback's, so this tests the tunnel's TCP windows, not a real long path")
+
 var stressHide = flag.String("web-stress-hide", "",
 	`TestBrowserWebRTCStress: "send" or "listen" runs that side's browser in a window, minimized during the transfer, with Chrome's throttling of hidden pages on`)
 
@@ -1401,7 +1404,8 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
 	srv := newWebServer(t, dm)
 
-	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}})
+	delay := strconv.Itoa(int(stressDelay.Milliseconds() / 2)) // each side holds what it receives
+	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}})
 	p.send = launchChrome(t, bin, opts["send"]...)
 	allocate(t, p.send)
 	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
@@ -1415,6 +1419,7 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			"gate":     {""},
 			"hooks":    {""},
 			"timeline": {""},
+			"delay":    {delay},
 		}).Encode()),
 		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
 	)

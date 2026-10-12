@@ -12,6 +12,7 @@ package rtcpolicy
 import (
 	"errors"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -356,33 +357,118 @@ func (b *Backoff) Reset() { b.next = 0 }
 // leaves gVisor's TCP in a retransmission timeout that resends a segment
 // or two per timeout, for minutes, while the connection looks healthy. One
 // drop at a time is a signal TCP answers with fast recovery, halving its
-// window, so the buffer drains back below the line. Its zero value is not
-// usable; set the fields. It is not safe for concurrent use.
+// window, so the buffer drains back below the line.
+//
+// The line is a time, not a size: the bytes the path drains in Target, at
+// the rate the Shedder measures it draining. A byte count suits one
+// path's speed only: what a fast path drains in a few milliseconds is
+// seconds of queue on a slow uplink, and the tunnel's round trips, and
+// everything waiting behind the queue, grow by that much. Its zero value
+// is not usable; set the fields. It is not safe for concurrent use.
 type Shedder struct {
-	// Above SoftLimit buffered bytes, one datagram is dropped every
-	// Every; above HardLimit, every datagram is. HardLimit belongs above
-	// what one TCP connection can have in flight, so that a hidden tab's
-	// late view of its buffer, or a burst, doesn't reach it.
-	SoftLimit, HardLimit int
-	Every                time.Duration
+	// Target is how long, at the path's measured rate, the buffered
+	// bytes may take to drain before the Shedder sheds.
+	Target time.Duration
+	// The line is never below MinLimit bytes, so that a slow path still
+	// holds a few datagrams, nor above HardLimit; it is InitialLimit
+	// until the rate is measured. Above HardLimit every datagram is
+	// dropped. HardLimit belongs above what one TCP connection can have
+	// in flight, so that a hidden tab's late view of its buffer, or a
+	// burst, doesn't reach it.
+	MinLimit, InitialLimit, HardLimit int
+	// Once the buffer has stayed above the line for Every, one datagram
+	// is dropped every Every while it does. A burst, as a TCP window
+	// sent at once after a long round trip, crosses the line and drains
+	// within milliseconds: only a queue that stands is shed, as CoDel
+	// does, or every burst would cost TCP half its window.
+	Every time.Duration
 
-	last time.Time
+	aboveSince time.Time // when the buffer last went above the line; zero while below
+	last       time.Time // of the last drop above the line
+
+	samples  [rateSamples]float64 // the latest drain rates measured, bytes per second
+	next     int                  // index in samples of the next one
+	sampleAt time.Time            // when buffered was last sampled for the rate
+	sampled  int                  // buffered bytes then
+	added    int                  // bytes sent since then
 }
 
-// Drop reports whether to drop a datagram sent at now, with buffered
-// bytes waiting in the path ahead of it.
-func (s *Shedder) Drop(buffered int, now time.Time) bool {
+const (
+	// rateSampleEvery is the shortest interval over which a Shedder
+	// measures its path's drain rate. A page's view of a buffer moves
+	// only between its tasks, so shorter intervals measure the page,
+	// not the path.
+	rateSampleEvery = 50 * time.Millisecond
+	// rateSamples is how many of its latest measurements a Shedder
+	// takes the path's rate from: the fastest of them, since a buffer
+	// that empties partway through an interval drains less than the
+	// path could carry, and no interval measures more than it can.
+	// When a path slows, its line follows once the faster measurements
+	// have aged out, after rateSamples backlogged intervals: meanwhile
+	// its queue may hold up to that long (half a second) at the slower
+	// rate, still within HardLimit.
+	rateSamples = 10
+)
+
+// Drop reports whether to drop a datagram of size bytes sent at now, with
+// buffered bytes waiting in the path ahead of it. The datagram's size
+// counts toward the drain rate unless it is dropped.
+func (s *Shedder) Drop(buffered, size int, now time.Time) bool {
+	s.measure(buffered, now)
+	drop := false
 	switch {
 	case buffered > s.HardLimit:
-		return true
-	case buffered <= s.SoftLimit:
-		return false
+		drop = true
+	case buffered <= s.Limit():
+		s.aboveSince = time.Time{}
+	case s.aboveSince.IsZero():
+		s.aboveSince = now
+	case now.Sub(s.aboveSince) < s.Every:
 	case !s.last.IsZero() && now.Sub(s.last) < s.Every:
-		return false
+	default:
+		s.last = now
+		drop = true
 	}
-	s.last = now
-	return true
+	if !drop {
+		s.added += size
+	}
+	return drop
 }
+
+// measure takes a drain rate from buffered, the path's buffer at now.
+// Only an interval that began and ended with bytes waiting counts: an
+// empty buffer drains no faster than it is filled, which says nothing of
+// what the path could carry.
+func (s *Shedder) measure(buffered int, now time.Time) {
+	if s.sampleAt.IsZero() {
+		s.sampleAt, s.sampled = now, buffered
+		return
+	}
+	dt := now.Sub(s.sampleAt)
+	if dt < rateSampleEvery {
+		return
+	}
+	if drained := s.sampled + s.added - buffered; s.sampled > 0 && buffered > 0 && drained > 0 {
+		s.samples[s.next] = float64(drained) / dt.Seconds()
+		s.next = (s.next + 1) % rateSamples
+	}
+	s.sampleAt, s.sampled, s.added = now, buffered, 0
+}
+
+// Limit returns the buffered bytes above which the Shedder sheds: what
+// the path drains in Target at its measured rate, within MinLimit and
+// HardLimit.
+func (s *Shedder) Limit() int {
+	r := s.Rate()
+	if r == 0 {
+		return s.InitialLimit
+	}
+	return min(max(int(r*s.Target.Seconds()), s.MinLimit), s.HardLimit)
+}
+
+// Rate returns the drain rate the Shedder has measured, in bytes per
+// second; 0 until it has.
+func (s *Shedder) Rate() float64 { return slices.Max(s.samples[:]) }
 
 // CheckDataOnly reports an error unless sdp describes a data channel
 // session and nothing else: exactly one media section, and that an
