@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1311,11 +1312,16 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		name string
 		ctx  context.Context
 	}{{"listener", p.listen}, {"sender", p.send}} {
-		// The sender closes its tunnel once the listener has everything,
-		// which ends the path: a "derp" may follow, but only last.
+		// Each page records its paths as its side of the transfer
+		// completes, before it closes the connection: the sender once
+		// the listener's close confirms delivery. The tunnel's teardown
+		// that follows may move the traffic, and isn't counted, but a
+		// move to DERP during the transfer is.
 		var paths []string
-		p.step(tab.ctx, tab.name+": reading the paths", 10*time.Second, chromedp.Evaluate(`window.tcTest.paths`, &paths))
-		if len(paths) == 0 || paths[0] != "webrtc" || len(paths) > 2 || (len(paths) == 2 && paths[1] != "derp") {
+		p.step(tab.ctx, tab.name+": reading the paths", 10*time.Second,
+			poll(`window.tcTest.pathsAtDone !== null`),
+			chromedp.Evaluate(`window.tcTest.pathsAtDone`, &paths))
+		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
 			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
 		}
 	}

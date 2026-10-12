@@ -45,9 +45,9 @@ func PickBestRegion(ctx context.Context, dm *tailcfg.DERPMap) (regionID tailcfg.
 		if r == nil || r.Avoid || r.NoMeasureNoHome || len(r.Nodes) == 0 {
 			continue
 		}
-		host := r.Nodes[0].HostName
+		url := derpProbeURL(r.Nodes[0])
 		wg.Go(func() {
-			d, ok := probeRegion(ctx, host)
+			d, ok := probeRegion(ctx, url)
 			if !ok {
 				return
 			}
@@ -62,12 +62,12 @@ func PickBestRegion(ctx context.Context, dm *tailcfg.DERPMap) (regionID tailcfg.
 	return regionID, nil
 }
 
-// probeRegion reports the fastest of regionProbes requests to host's
-// /derp/probe after a first that opens the connection, and whether
-// they all succeeded.
-func probeRegion(ctx context.Context, host string) (time.Duration, bool) {
+// probeRegion reports the fastest of regionProbes requests to url
+// after a first that opens the connection, and whether they all
+// succeeded.
+func probeRegion(ctx context.Context, url string) (time.Duration, bool) {
 	probe := func() (time.Duration, bool) {
-		req, err := http.NewRequestWithContext(ctx, "HEAD", "https://"+host+"/derp/probe", nil)
+		req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 		if err != nil {
 			return 0, false
 		}

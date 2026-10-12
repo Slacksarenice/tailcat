@@ -21,6 +21,7 @@ window.tcTest = {
   sendDone: false,
   path: null, // "webrtc" or "derp" once reported
   paths: [],  // every path reported, in order
+  pathsAtDone: null, // paths as they stood when this side's transfer completed
   stats: null, // the last onPathStats report
   go: false,  // with ?gate, the sender waits for the test to set this
   errors: [],
@@ -329,6 +330,7 @@ async function countSink(conn) {
     window.tcTest.recvBytes = n;
   }
   window.tcTest.recvBad = bad;
+  window.tcTest.pathsAtDone = window.tcTest.paths.slice();
   window.tcTest.recvDone = true;
   conn.close();
 }
@@ -417,6 +419,7 @@ async function sendStream(addr, size, readChunk, progressEl) {
   // Wait for the receiver's close: like the CLI, the peer's EOF is
   // the confirmation that everything we sent was delivered.
   while ((await conn.read()) !== null) {}
+  window.tcTest.pathsAtDone = window.tcTest.paths.slice();
   conn.close();
   window.tcTest.sentBytes = off;
   window.tcTest.sendDone = true;
