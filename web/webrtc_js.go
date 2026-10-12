@@ -128,11 +128,17 @@ const (
 	// minPeerRestartGap paces the ICE restarts the answerer asks for.
 	minPeerRestartGap = 5 * time.Second
 
-	// maxBuffered is how much a DataChannel may hold unsent before
-	// datagrams are dropped, as a full UDP socket would; inner TCP
-	// then slows down. It is kept small because pings queue behind it.
-	maxBuffered = 256 << 10
-	maxFrame    = frameHeaderLen + 65535
+	// Above softBuffered bytes waiting in the DataChannel, one datagram
+	// is dropped every shedEvery, which inner TCP answers by halving its
+	// window; above hardBuffered, every datagram is (see
+	// rtcpolicy.Shedder). hardBuffered is above the 6 MiB a tailscale
+	// netstack TCP connection can have in flight, and well under the
+	// 16 MiB at which Chrome closes a channel. Pings travel on the
+	// control channel, so they don't wait behind the datagrams.
+	softBuffered = 256 << 10
+	hardBuffered = 8 << 20
+	shedEvery    = 100 * time.Millisecond
+	maxFrame     = frameHeaderLen + 65535
 
 	// qualifyTimeout is how long, from the start of signaling, a
 	// session may take to qualify its channel before either side gives
@@ -373,6 +379,7 @@ type rtcSession struct {
 	qualified      bool
 	probeAcks      int
 	live           rtcpolicy.Liveness
+	shed           rtcpolicy.Shedder
 	restarting     bool   // an ICE restart's offer is being made
 	restartAgain   string // why to restart ICE again once the offer under way is answered
 	remoteSet      bool
@@ -420,6 +427,11 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			MinHold:         minHold,
 			MaxHold:         maxHold,
 			StableFor:       stableFor,
+		},
+		shed: rtcpolicy.Shedder{
+			SoftLimit: softBuffered,
+			HardLimit: hardBuffered,
+			Every:     shedEvery,
 		},
 	}
 	pc, err := func() (pc js.Value, err error) {
@@ -858,9 +870,9 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	if !s.qualified || s.live.Suspect() || frameHeaderLen+len(pkt) > maxFrame {
 		return false
 	}
-	if s.dc.Get("bufferedAmount").Int() > maxBuffered {
+	if s.shed.Drop(s.dc.Get("bufferedAmount").Int(), time.Now()) {
 		s.dropped++
-		return true // drop, like a full UDP socket
+		return true // dropped: inner TCP slows down
 	}
 	b := s.sendScratch[:frameHeaderLen+len(pkt)]
 	b[0] = frameWG

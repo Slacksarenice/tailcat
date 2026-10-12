@@ -349,6 +349,41 @@ func (b *Backoff) Next(up bool, lasted time.Duration) time.Duration {
 // when an attempt that failed before may now succeed.
 func (b *Backoff) Reset() { b.next = 0 }
 
+// Shedder decides which datagrams a path drops while its send buffer is
+// full. Inner TCP learns of congestion only from loss, so the path must
+// drop something, but how much matters: a full window lost at once (every
+// datagram while the buffer is above a line, as a full UDP socket does)
+// leaves gVisor's TCP in a retransmission timeout that resends a segment
+// or two per timeout, for minutes, while the connection looks healthy. One
+// drop at a time is a signal TCP answers with fast recovery, halving its
+// window, so the buffer drains back below the line. Its zero value is not
+// usable; set the fields. It is not safe for concurrent use.
+type Shedder struct {
+	// Above SoftLimit buffered bytes, one datagram is dropped every
+	// Every; above HardLimit, every datagram is. HardLimit belongs above
+	// what one TCP connection can have in flight, so that a hidden tab's
+	// late view of its buffer, or a burst, doesn't reach it.
+	SoftLimit, HardLimit int
+	Every                time.Duration
+
+	last time.Time
+}
+
+// Drop reports whether to drop a datagram sent at now, with buffered
+// bytes waiting in the path ahead of it.
+func (s *Shedder) Drop(buffered int, now time.Time) bool {
+	switch {
+	case buffered > s.HardLimit:
+		return true
+	case buffered <= s.SoftLimit:
+		return false
+	case !s.last.IsZero() && now.Sub(s.last) < s.Every:
+		return false
+	}
+	s.last = now
+	return true
+}
+
 // CheckDataOnly reports an error unless sdp describes a data channel
 // session and nothing else: exactly one media section, and that an
 // "application" one. The tunnel carries only datagrams, so a
