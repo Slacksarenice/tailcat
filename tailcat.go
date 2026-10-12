@@ -1871,7 +1871,7 @@ func tcAddrForKey(k key.NodePublic) netip.Addr {
 }
 
 func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
-	return netstack.Create(logf,
+	ns, err := netstack.Create(logf,
 		sys.Tun.Get(),
 		sys.Engine.Get(),
 		sys.MagicSock.Get(),
@@ -1879,6 +1879,11 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 		sys.DNSManager.Get(),
 		sys.ProxyMapper(),
 	)
+	if err != nil {
+		return nil, err
+	}
+	tuneTCP(logf, ns)
+	return ns, nil
 }
 
 // createEngine creates the wgengine.Engine with userspace networking.
