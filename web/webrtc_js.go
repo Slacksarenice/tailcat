@@ -54,6 +54,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall/js"
@@ -321,7 +322,14 @@ type signalMsg struct {
 	T    string          `json:"t"`
 	SDP  string          `json:"sdp,omitempty"`
 	Cand json.RawMessage `json:"cand,omitempty"` // RTCIceCandidateInit
+	// Caps, on an offer, lists what the offerer understands beyond the
+	// messages above: capRestart if the answerer may send "restart". An
+	// offerer that predates it ends the session on a message it doesn't
+	// know, so the answerer sends one only to an offerer that lists it.
+	Caps []string `json:"caps,omitempty"`
 }
+
+const capRestart = "restart"
 
 // rtcSession is one RTCPeerConnection to a peer and the packet path
 // over its DataChannel. Its signaling stream lives as long as it does:
@@ -359,6 +367,7 @@ type rtcSession struct {
 	dropped        int64
 	lastRestartAt  time.Time // when the last ICE restart began (offerer)
 	lastRestartAsk time.Time // when this side last asked for one (answerer)
+	peerRestarts   bool      // the offerer takes "restart" (answerer; see signalMsg.Caps)
 	qualifying     bool      // qualify has started
 	qualified      bool
 	probeAcks      int
@@ -464,6 +473,7 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			s.live.MarkSuspect(time.Now())
 			s.mu.Unlock()
 			s.setHookState()
+			go s.syncReport() // off this JS callback: it takes notifyMu
 			return
 		case st == "failed" && up:
 			now := time.Now()
@@ -476,6 +486,7 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			}
 			s.mu.Unlock()
 			s.setHookState()
+			go s.syncReport()
 			switch {
 			case restart:
 				go s.restartICE("ICE failed", false)
@@ -598,7 +609,14 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		s.remoteSet = true
 		pending := s.pendingCands
 		s.pendingCands = nil
+		if answerer {
+			s.peerRestarts = slices.Contains(m.Caps, capRestart)
+		}
+		restarts := s.peerRestarts
 		s.mu.Unlock()
+		if answerer && s.hooks.Truthy() {
+			s.hooks.Set("peerRestarts", restarts)
+		}
 		for _, c := range pending {
 			s.addCandidate(c)
 		}
@@ -716,7 +734,11 @@ func (s *rtcSession) describe() error {
 	if s.hooks.Truthy() {
 		s.hooks.Set("localSDP", sdp)
 	}
-	s.sendSignal(signalMsg{T: desc.Get("type").String(), SDP: sdp})
+	m := signalMsg{T: desc.Get("type").String(), SDP: sdp}
+	if s.offerer {
+		m.Caps = []string{capRestart}
+	}
+	s.sendSignal(m)
 	return nil
 }
 
@@ -1068,10 +1090,11 @@ func (s *rtcSession) candidatePair() (local, remote, proto string) {
 }
 
 // askRestart asks the offerer to restart ICE, as only it can, at most
-// once per minPeerRestartGap.
+// once per minPeerRestartGap, if the offerer said it understands the
+// request.
 func (s *rtcSession) askRestart(why string) {
 	s.mu.Lock()
-	soon := time.Since(s.lastRestartAsk) < minPeerRestartGap
+	soon := !s.peerRestarts || time.Since(s.lastRestartAsk) < minPeerRestartGap
 	if !soon {
 		s.lastRestartAsk = time.Now()
 	}
@@ -1227,6 +1250,7 @@ func (s *rtcSession) networkChanged() bool {
 	}
 	s.countHook("netChecks")
 	s.setHookState()
+	go s.syncReport()
 	s.sendControl(framePing, seq, 0)
 	if s.offerer {
 		s.restartICE("network changed", true)

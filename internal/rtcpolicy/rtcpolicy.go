@@ -85,14 +85,25 @@ type Liveness struct {
 	suspect   bool
 	restarted bool // Restart was reported in the current outage
 
-	sentSeq   uint32    // the last ping Tick asked for
-	sentAt    time.Time // and when
+	// The pings Tick asked for lately, by sequence number modulo
+	// rttSlots, so that a round trip longer than the ping interval is
+	// still measured: each answer is timed against its own ping.
+	sent      [rttSlots]sentPing
 	srtt      time.Duration
 	lastHeard time.Time // when traffic last arrived over the path
 
 	hold          time.Duration // the hold the next recovery waits out
 	recoverAt     time.Time     // a recovery waiting out its hold, if non-zero
 	lastRecovered time.Time
+}
+
+// rttSlots is how many of the latest pings are kept for timing their
+// answers: at a ping every two seconds, round trips up to sixteen.
+const rttSlots = 8
+
+type sentPing struct {
+	seq uint32
+	at  time.Time // zero once answered
 }
 
 // suspectAfter is how long the oldest unanswered ping may wait before
@@ -119,7 +130,7 @@ func (l *Liveness) RTT() time.Duration { return l.srtt }
 func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	l.seq++
 	seq := l.seq
-	l.sentSeq, l.sentAt = seq, now
+	l.sent[seq%rttSlots] = sentPing{seq, now}
 	asleep := !l.lastTick.IsZero() && now.Sub(l.lastTick) > l.MaxTickGap
 	l.lastTick = now
 	if asleep {
@@ -127,13 +138,22 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 		l.becomeSuspect(now, false)
 		return Suspect, seq
 	}
-	if l.suspect && !l.recoverAt.IsZero() && !now.Before(l.recoverAt) {
-		l.recover(now)
-	}
 	if l.waitStart.IsZero() {
 		l.waitStart, l.waitSeq = now, seq
 	}
 	waited := now.Sub(l.waitStart)
+	if l.suspect && !l.recoverAt.IsZero() {
+		switch {
+		case waited >= l.suspectAfter():
+			// The path stopped answering again while its recovery waited
+			// out the hold: that recovery never happened, so it is
+			// neither recorded nor counted as a relapse. The next answer
+			// starts the same hold over.
+			l.recoverAt = time.Time{}
+		case !now.Before(l.recoverAt):
+			l.recover(now)
+		}
+	}
 	if !l.suspect && l.lastHeard.After(l.waitStart) {
 		// Traffic arriving over the path shows it still works while
 		// the pings' answers are late (queued behind that traffic, say).
@@ -159,20 +179,22 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 
 // becomeSuspect marks the path Suspect, cancelling any recovery waiting
 // out its hold. relapse is false when the cause is this side's own
-// (throttled timers): that isn't held against the path.
+// (throttled timers): that isn't held against the path, though a path
+// that has stayed healthy for StableFor still drops its old hold.
 func (l *Liveness) becomeSuspect(now time.Time, relapse bool) {
 	l.recoverAt = time.Time{}
 	if l.suspect {
 		return
 	}
 	l.suspect = true
-	if !relapse || l.MaxHold == 0 {
+	if l.MaxHold == 0 {
 		return
 	}
-	if !l.lastRecovered.IsZero() && now.Sub(l.lastRecovered) < l.StableFor {
-		l.hold = min(max(2*l.hold, l.MinHold), l.MaxHold)
-	} else {
+	switch {
+	case l.lastRecovered.IsZero() || now.Sub(l.lastRecovered) >= l.StableFor:
 		l.hold = 0
+	case relapse:
+		l.hold = min(max(2*l.hold, l.MinHold), l.MaxHold)
 	}
 }
 
@@ -192,15 +214,15 @@ func (l *Liveness) Heard(now time.Time) { l.lastHeard = now }
 // soon after its last recovery returns only once Tick finds it has kept
 // answering for its hold.
 func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
-	if seq == l.sentSeq && !l.sentAt.IsZero() {
-		if rtt := now.Sub(l.sentAt); rtt >= 0 {
+	if p := &l.sent[seq%rttSlots]; p.seq == seq && !p.at.IsZero() {
+		if rtt := now.Sub(p.at); rtt >= 0 {
 			if l.srtt == 0 {
 				l.srtt = rtt
 			} else {
 				l.srtt = (7*l.srtt + rtt) / 8
 			}
 		}
-		l.sentAt = time.Time{}
+		p.at = time.Time{}
 	}
 	if l.waitStart.IsZero() || int32(seq-l.waitSeq) < 0 {
 		return false

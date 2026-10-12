@@ -340,6 +340,100 @@ func TestLivenessHold(t *testing.T) {
 	}
 }
 
+// relapsed returns a Liveness whose path went Suspect again 9 s after
+// recovering, at 10 s, and was answered at 10.1 s: its recovery waits
+// out a 5 s hold, to 15.1 s.
+func relapsed(t *testing.T) *Liveness {
+	t.Helper()
+	l := newLiveness()
+	l.MinHold, l.MaxHold, l.StableFor = 5*time.Second, 30*time.Second, 60*time.Second
+	l.Tick(at(0))
+	l.MarkSuspect(at(1))
+	if !l.Pong(l.NextSeq(), at(1.1)) {
+		t.Fatalf("first recovery held")
+	}
+	for s := 2.0; s <= 8; s += 2 {
+		_, seq := l.Tick(at(s))
+		l.Pong(seq, at(s+0.1))
+	}
+	l.MarkSuspect(at(10))
+	if l.Pong(l.NextSeq(), at(10.1)) {
+		t.Fatalf("a relapse recovered at once")
+	}
+	return l
+}
+
+// TestLivenessHoldFails: a path that stops answering while its recovery
+// waits out the hold never recovered, so the hold doesn't double: the
+// next answer starts the same hold over.
+func TestLivenessHoldFails(t *testing.T) {
+	l := relapsed(t)
+	l.Tick(at(12)) // unanswered from here
+	l.Tick(at(14))
+	st, seq := l.Tick(at(16)) // the hold ended at 15.1s, but the 12s ping is 4s late
+	if st != Suspect {
+		t.Fatalf("at 16s, pings unanswered since 12s: %v; want Suspect", st)
+	}
+	l.Pong(seq, at(16.1)) // the same 5s hold, to 21.1s
+	for s := 18.0; s <= 20; s += 2 {
+		st, seq := l.Tick(at(s))
+		if st != Suspect {
+			t.Fatalf("at %vs, inside the hold: %v; want Suspect", s, st)
+		}
+		l.Pong(seq, at(s+0.1))
+	}
+	if st, _ := l.Tick(at(22)); st != Healthy {
+		t.Fatalf("at 22s, after a 5s hold: %v; want Healthy (the failed recovery doubled the hold)", st)
+	}
+}
+
+// TestLivenessHoldExpires: a path that stayed healthy for StableFor after
+// its last relapse drops the hold even when its next suspicion is this
+// side's own (a timer gap), so an answer brings it straight back.
+func TestLivenessHoldExpires(t *testing.T) {
+	l := relapsed(t)
+	for s := 12.0; s <= 80; s += 2 { // recovers at 16s, then a stable minute
+		_, seq := l.Tick(at(s))
+		l.Pong(seq, at(s+0.1))
+	}
+	st, seq := l.Tick(at(100)) // a hidden tab's 20s timer gap
+	if st != Suspect {
+		t.Fatalf("after a 20s gap: %v; want Suspect", st)
+	}
+	if !l.Pong(seq, at(100.1)) {
+		t.Errorf("a path stable for a minute was held after a timer gap")
+	}
+}
+
+// TestLivenessSlowRTT: a round trip longer than the ping interval is
+// measured, each answer timed against its own ping, and a path that
+// answers every ping that slowly stays Healthy.
+func TestLivenessSlowRTT(t *testing.T) {
+	l := newLiveness()
+	l.SuspectAfter = 6 * time.Second
+	l.MinSuspectAfter, l.MaxSuspectAfter = 3*time.Second, 8*time.Second
+	const rtt = 4.1
+	type ping struct {
+		seq uint32
+		at  float64
+	}
+	var out []ping // in the order sent, so in the order answered
+	for s := 0.0; s <= 40; s += 2 {
+		for len(out) > 0 && out[0].at+rtt <= s {
+			l.Pong(out[0].seq, at(out[0].at+rtt))
+			out = out[1:]
+		}
+		st, seq := l.Tick(at(s))
+		if st != Healthy {
+			t.Fatalf("at %vs, every ping answered in %vs: %v; want Healthy", s, rtt, st)
+		}
+		out = append(out, ping{seq, s})
+	}
+	if got := l.RTT(); got < 4*time.Second || got > 4200*time.Millisecond {
+		t.Errorf("RTT %v; want about 4.1s", got)
+	}
+}
+
 func TestCheckDataOnly(t *testing.T) {
 	const head = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"
 	data := "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\n"

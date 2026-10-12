@@ -1120,14 +1120,17 @@ func (p *tabPair) checkDataOnly() {
 }
 
 // TestBrowserWebRTCDataOnly checks that the session the tabs negotiate
-// carries one data section and no audio or video, and that the page
-// hears the path's stats: a measured round trip and the candidate pair.
+// carries one data section and no audio or video, that the listener
+// learns the dialer takes restart requests, and that the page hears the
+// path's stats: a measured round trip and the candidate pair.
 func TestBrowserWebRTCDataOnly(t *testing.T) {
 	p := newTabPair(t)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
 	srv := newWebServer(t, dm)
 	p.webrtcTabs(srv, transferSize)
 	p.checkDataOnly()
+	p.step(p.listen, "listener: the dialer takes restart requests", 10*time.Second,
+		poll(`window.tailcatTestHooks.peerRestarts === true`))
 	p.eachTab("ping channel open", 10*time.Second, poll(`window.tailcatTestHooks.ctlOpen === true`))
 	p.eachTab("path stats", 10*time.Second,
 		poll(`window.tcTest.stats && window.tcTest.stats.path === "webrtc" && window.tcTest.stats.rttMs > 0 && window.tcTest.stats.local === "host"`),
