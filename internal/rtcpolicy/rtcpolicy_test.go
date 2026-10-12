@@ -279,6 +279,28 @@ func TestLivenessHeard(t *testing.T) {
 	}
 }
 
+// TestLivenessHeardDeadlines: once traffic stops postponing a long-late
+// answer, the path still goes Suspect, then Restart, then Dead, each
+// timed from the last traffic, not from the unanswered ping.
+func TestLivenessHeardDeadlines(t *testing.T) {
+	l := newLiveness()
+	l.Tick(at(0)) // never answered
+	for s := 2.0; s <= 20; s += 2 {
+		l.Heard(at(s - 0.5))
+		if st, _ := l.Tick(at(s)); st != Healthy {
+			t.Fatalf("at %vs, traffic heard at %vs: %v; want Healthy", s, s-0.5, st)
+		}
+	}
+	// Last heard at 19.5s: Suspect after 4s, Restart after 6s, Dead after 15s.
+	want := map[float64]State{22: Healthy, 24: Suspect, 26: Restart, 28: Suspect, 34: Suspect, 36: Dead}
+	for s := 22.0; s <= 36; s += 2 {
+		st, _ := l.Tick(at(s))
+		if w, ok := want[s]; ok && st != w {
+			t.Errorf("at %vs: %v; want %v", s, st, w)
+		}
+	}
+}
+
 // TestLivenessHold: a path that relapses soon after recovering must
 // keep answering for a hold, doubling with each relapse, before traffic
 // returns; one that stays healthy long enough loses the hold.

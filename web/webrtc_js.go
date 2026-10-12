@@ -650,10 +650,22 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		s.addCandidate(m.Cand)
 		return nil
 	case m.T == "restart" && !answerer:
+		now := time.Now()
 		s.mu.Lock()
-		soon := time.Since(s.lastRestartAt) < minPeerRestartGap
+		soon := now.Sub(s.lastRestartAt) < minPeerRestartGap
+		up := s.qualified && s.ctx.Err() == nil
+		if !soon && up {
+			// The restart is this outage's, as for a network change:
+			// traffic goes over DERP meanwhile, and this side's pings
+			// don't start another restart on top of it.
+			s.live.Restarted(now)
+		}
 		s.mu.Unlock()
 		if !soon {
+			if up {
+				s.setHookState()
+				go s.syncReport()
+			}
 			go s.restartICE("the peer's pings go unanswered", false)
 		}
 		return nil

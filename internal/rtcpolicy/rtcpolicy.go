@@ -146,6 +146,15 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	if l.waitStart.IsZero() {
 		l.waitStart, l.waitSeq = now, seq
 	}
+	if !l.suspect && l.lastHeard.After(l.waitStart) {
+		// Traffic arriving over the path shows it still works while
+		// the pings' answers are late (queued behind that traffic, say).
+		// It postpones suspicion, but can't end it: only an answer
+		// proves the way there works too. The wait is timed from the
+		// traffic on, so that once suspicion begins, Restart and Dead
+		// still follow it in turn.
+		l.waitStart = l.lastHeard
+	}
 	waited := now.Sub(l.waitStart)
 	if l.suspect && !l.recoverAt.IsZero() {
 		switch {
@@ -161,13 +170,6 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 			// answer to the gap's fresh ping (see Pong).
 			l.recover(now)
 		}
-	}
-	if !l.suspect && l.lastHeard.After(l.waitStart) {
-		// Traffic arriving over the path shows it still works while
-		// the pings' answers are late (queued behind that traffic, say).
-		// It postpones suspicion, but can't end it: only an answer
-		// proves the way there works too.
-		waited = now.Sub(l.lastHeard)
 	}
 	switch {
 	case waited >= l.DeadAfter:
