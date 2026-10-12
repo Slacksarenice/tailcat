@@ -42,6 +42,10 @@ const (
 	derpFrameOverhead = 5 + 32
 	// derpShedLogEvery paces the log line of packets shed.
 	derpShedLogEvery = 10 * time.Second
+
+	// browserMaxWindow is 0: with every path's queue held short, the
+	// tunnel's TCP windows needn't be capped (see tuneTCP).
+	browserMaxWindow = 0
 )
 
 func init() {

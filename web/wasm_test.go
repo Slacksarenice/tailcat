@@ -1430,6 +1430,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	case "listen":
 		minimize(t, p.listen)
 	}
+	// Each page's first stats report, ICE's round trip in it, comes a
+	// couple of seconds after its path; a short transfer can end the
+	// session before then.
+	p.eachTab("ICE's round trip", 15*time.Second, poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`))
 	if *stressProfile != "" {
 		startProfile(t, p.listen)
 		startProfile(t, p.send)
@@ -1488,10 +1492,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
 			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
 		}
-		// The network's round trip, as ICE times it, beside the pings'.
+		// The network's round trip, as ICE last timed it, beside the
+		// pings'.
 		var iceRTT float64
 		p.step(tab.ctx, tab.name+": reading ICE's round trip", 10*time.Second,
-			poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`),
 			chromedp.Evaluate(`window.tcTest.stats.iceRttMs`, &iceRTT))
 		t.Logf("%s: round trip %.1f ms by ICE", tab.name, iceRTT)
 	}

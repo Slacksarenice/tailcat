@@ -67,10 +67,22 @@ func tuneMTU() {
 // holds more than a few tens of milliseconds at the rate it drains
 // (rtcpolicy.Shedder; web/webrtc_js.go, derpws_js.go), which TCP answers
 // by slowing down, so the queues, and the round trips through them,
-// stay short whatever the window.
+// stay short whatever the window. A build without them caps the windows
+// instead (browserMaxWindow).
 func tuneTCP(logf logger.Logf, ns *netstack.Impl) {
 	opt := tcpip.TCPMinRTOOption(browserMinRTO)
 	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
 		logf("tailcat: setting TCP's minimum RTO: %v", err)
+	}
+	if browserMaxWindow == 0 {
+		return
+	}
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: browserMaxWindow}
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
+		logf("tailcat: setting TCP's send buffer sizes: %v", err)
+	}
+	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: browserMaxWindow}
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
+		logf("tailcat: setting TCP's receive buffer sizes: %v", err)
 	}
 }

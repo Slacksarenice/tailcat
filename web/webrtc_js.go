@@ -182,8 +182,9 @@ var (
 // probeSize is the size of the qualification probes: larger than any
 // WireGuard datagram for the tunnel's MTU (the MTU plus 32 bytes of
 // WireGuard overhead; the wire MTU adds IP and UDP headers besides), so
-// a path that drops large messages never qualifies.
-func probeSize() int { return frameHeaderLen + int(tstun.DefaultWireMTU()) }
+// a path that drops large messages never qualifies. It is no larger
+// than a frame can be, which a WireGuard datagram never exceeds.
+func probeSize() int { return min(frameHeaderLen+int(tstun.DefaultWireMTU()), maxFrame) }
 
 // rtcOptions is the parsed "webrtc" option of tailcatListen and
 // tailcatDial: false/absent, true, or {iceServers: [...]}.
