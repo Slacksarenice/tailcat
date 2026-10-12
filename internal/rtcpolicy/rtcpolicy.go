@@ -1,0 +1,251 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+// Package rtcpolicy decides, for the browser build's WebRTC packet path
+// (web/webrtc_js.go), when a path stops being trusted, when to restart
+// its ICE or give up on it, what a failed signaling attempt says about
+// the server, and how long to wait before negotiating again. It is
+// plain Go, apart from the js/wasm code that uses it, so that it can be
+// tested natively.
+package rtcpolicy
+
+import (
+	"errors"
+	"net"
+	"strings"
+	"time"
+)
+
+// State is what a Liveness makes of its path.
+type State int
+
+const (
+	// Healthy: the path answers; send over it.
+	Healthy State = iota
+	// Suspect: the path hasn't answered for a while. Send over the
+	// relay instead, and keep pinging: an answer makes it Healthy again.
+	Suspect
+	// Restart is Suspect, reported once per outage when it has lasted
+	// long enough that the offering side should restart ICE.
+	Restart
+	// Dead: the path has been silent too long. End the session.
+	Dead
+)
+
+func (s State) String() string {
+	switch s {
+	case Healthy:
+		return "healthy"
+	case Suspect:
+		return "suspect"
+	case Restart:
+		return "restart"
+	case Dead:
+		return "dead"
+	}
+	return "unknown"
+}
+
+// Liveness tracks whether a path answers the pings sent over it. Its
+// zero value is not usable; set the durations. It is not safe for
+// concurrent use.
+type Liveness struct {
+	// SuspectAfter is how long the oldest unanswered ping may wait
+	// before the path is Suspect, RestartAfter before it is reported as
+	// Restart, and DeadAfter before it is Dead.
+	SuspectAfter, RestartAfter, DeadAfter time.Duration
+	// MaxTickGap is the longest expected gap between Tick calls. A
+	// longer one means this side's timers were held back (a hidden
+	// tab's are throttled), so the time in between isn't held against
+	// the peer: the wait starts over, from a fresh ping, with the path
+	// Suspect until that is answered.
+	MaxTickGap time.Duration
+
+	seq       uint32
+	waitSeq   uint32    // the ping that started the current wait
+	waitStart time.Time // when it was sent; zero if no ping is unanswered
+	lastTick  time.Time
+	suspect   bool
+	restarted bool // Restart was reported in the current outage
+}
+
+// Tick is called at each ping interval. It returns the path's state and
+// the sequence number of the ping to send now.
+func (l *Liveness) Tick(now time.Time) (State, uint32) {
+	l.seq++
+	seq := l.seq
+	asleep := !l.lastTick.IsZero() && now.Sub(l.lastTick) > l.MaxTickGap
+	l.lastTick = now
+	if asleep {
+		l.waitStart, l.waitSeq = now, seq
+		l.suspect = true
+		return Suspect, seq
+	}
+	if l.waitStart.IsZero() {
+		l.waitStart, l.waitSeq = now, seq
+	}
+	waited := now.Sub(l.waitStart)
+	switch {
+	case waited >= l.DeadAfter:
+		return Dead, seq
+	case waited >= l.RestartAfter && !l.restarted:
+		l.restarted, l.suspect = true, true
+		return Restart, seq
+	case waited >= l.SuspectAfter:
+		l.suspect = true
+	}
+	if l.suspect {
+		return Suspect, seq
+	}
+	return Healthy, seq
+}
+
+// Pong records the answer to ping seq. An answer to any ping sent since
+// the current wait began ends it: later pings may still be queued
+// behind data on a slow uplink. It reports whether the path was
+// Suspect, and so whether traffic may return to it.
+func (l *Liveness) Pong(seq uint32) (recovered bool) {
+	if l.waitStart.IsZero() || int32(seq-l.waitSeq) < 0 {
+		return false
+	}
+	l.waitStart = time.Time{}
+	recovered = l.suspect
+	l.suspect, l.restarted = false, false
+	return recovered
+}
+
+// MarkSuspect makes the path Suspect at once, as when ICE reports it
+// disconnected, and starts the wait for an answer if none is under way.
+func (l *Liveness) MarkSuspect(now time.Time) {
+	l.suspect = true
+	if l.waitStart.IsZero() {
+		l.waitStart, l.waitSeq = now, l.seq+1 // the next ping's
+	}
+}
+
+// NextSeq returns the sequence number for a ping sent between ticks, as
+// one sent at once to check a path that may just have broken. Sent after
+// MarkSuspect, its answer ends the suspicion.
+func (l *Liveness) NextSeq() uint32 {
+	l.seq++
+	return l.seq
+}
+
+// TakeRestart reports whether a restart may be tried now, as when ICE
+// reports the path failed: true unless one was already tried in the
+// current outage. It marks the path Suspect.
+func (l *Liveness) TakeRestart(now time.Time) bool {
+	l.MarkSuspect(now)
+	if l.restarted {
+		return false
+	}
+	l.restarted = true
+	return true
+}
+
+// Suspect reports whether traffic should stay off the path.
+func (l *Liveness) Suspect() bool { return l.suspect }
+
+// Backoff paces a client's attempts to negotiate a path. Its zero value
+// is not usable; set the durations.
+type Backoff struct {
+	// Min is the first wait, which doubles after each attempt up to
+	// Max, or up to MaxAfterUp once any session has carried traffic (the
+	// two networks can reach each other, so a lost path is worth
+	// winning back sooner).
+	Min, Max, MaxAfterUp time.Duration
+	// HealthyFor is how long a session that carried traffic must have
+	// lasted for the next wait to start over from Min. A path that
+	// keeps failing soon after it comes up keeps backing off.
+	HealthyFor time.Duration
+
+	next   time.Duration
+	everUp bool
+}
+
+// Next returns how long to wait before the next attempt, given how the
+// last one went: up reports whether its path carried traffic, and
+// lasted how long its session ran.
+func (b *Backoff) Next(up bool, lasted time.Duration) time.Duration {
+	ceiling := b.Max
+	if up {
+		b.everUp = true
+		if lasted >= b.HealthyFor {
+			b.next = 0
+		}
+	}
+	if b.everUp {
+		ceiling = b.MaxAfterUp
+	}
+	if b.next == 0 {
+		b.next = b.Min
+	} else {
+		b.next = min(2*b.next, ceiling)
+	}
+	return b.next
+}
+
+// Reset makes the next wait the shortest, as after a network change,
+// when an attempt that failed before may now succeed.
+func (b *Backoff) Reset() { b.next = 0 }
+
+// SignalFailure is what a failed attempt to open a signaling stream says
+// about the server.
+type SignalFailure int
+
+const (
+	// Unreachable: the attempt couldn't reach the server (the tunnel is
+	// down for now). It says nothing about the server; try again.
+	Unreachable SignalFailure = iota
+	// Refused: the server refused the signaling port, as one with
+	// WebRTC off does. Don't try again.
+	Refused
+	// Silent: the server accepted the stream but never answered the
+	// preamble, as a server that isn't the web app (a native tailcat
+	// server, writing what it receives to its output) does. Don't try
+	// again: each attempt would write the preamble to it once more.
+	Silent
+	// Dropped: the server accepted the stream and then closed or reset
+	// it unanswered, as a web server does when it can't place the
+	// stream or is pacing its sessions. Try again, a few times.
+	Dropped
+)
+
+func (f SignalFailure) String() string {
+	switch f {
+	case Unreachable:
+		return "unreachable"
+	case Refused:
+		return "refused"
+	case Silent:
+		return "silent"
+	case Dropped:
+		return "dropped"
+	}
+	return "unknown"
+}
+
+// ClassifyDial classifies the error from dialing the signaling port.
+// The tunnel's TCP stack reports a reset answering the dial as a
+// connect error reading "connection was refused"; anything else, a
+// timeout above all, means the server wasn't reached.
+func ClassifyDial(err error) SignalFailure {
+	var oe *net.OpError
+	if errors.As(err, &oe) && oe.Op == "connect" && oe.Err != nil &&
+		strings.Contains(oe.Err.Error(), "refused") {
+		return Refused
+	}
+	return Unreachable
+}
+
+// ClassifyPreamble classifies the error from the preamble exchange on a
+// signaling stream that the server accepted: a timeout (the deadline
+// passed with no answer) means a server that doesn't speak it, and
+// anything else (end of stream, a reset) one that dropped the stream.
+func ClassifyPreamble(err error) SignalFailure {
+	var te interface{ Timeout() bool }
+	if errors.As(err, &te) && te.Timeout() {
+		return Silent
+	}
+	return Dropped
+}
