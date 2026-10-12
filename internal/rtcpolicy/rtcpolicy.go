@@ -97,6 +97,7 @@ type Liveness struct {
 	hold          time.Duration // the hold a relapse's recovery waits out
 	held          bool          // the current outage is a relapse: its recovery waits out the hold
 	recoverAt     time.Time     // a recovery waiting out its hold, if non-zero
+	gapped        bool          // a timer gap since the last answer: recovery waits for a fresh one
 	lastRecovered time.Time
 }
 
@@ -138,6 +139,7 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 	l.lastTick = now
 	if asleep {
 		l.waitStart, l.waitSeq = now, seq
+		l.gapped = true
 		l.becomeSuspect(now, false)
 		return Suspect, seq
 	}
@@ -153,7 +155,10 @@ func (l *Liveness) Tick(now time.Time) (State, uint32) {
 			// neither recorded nor counted as a relapse. The next answer
 			// starts the same hold over.
 			l.recoverAt = time.Time{}
-		case !now.Before(l.recoverAt):
+		case !l.gapped && !now.Before(l.recoverAt):
+			// The hold has passed, and nothing since the last answer says
+			// the path stopped: a timer gap since then leaves it to the
+			// answer to the gap's fresh ping (see Pong).
 			l.recover(now)
 		}
 	}
@@ -237,6 +242,7 @@ func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
 		return false
 	}
 	l.waitStart = time.Time{}
+	l.gapped = false
 	if !l.suspect {
 		return false
 	}
