@@ -109,6 +109,14 @@ class TailcatPeerConnection {
     }
     this.signalingState = "closed";
     this.connectionState = "closed";
+    // A closed connection may never settle the calls it had under way, and
+    // the page drops any answer to them: they fail now.
+    for (const [id, c] of pcCalls) {
+      if (c.pc === this) {
+        pcCalls.delete(id);
+        c.reject(new Error("the peer connection is closed"));
+      }
+    }
   }
 
   update(state) {
@@ -288,7 +296,13 @@ async function call(m) {
   switch (m.fn) {
     case "listen": {
       const opts = callbackOpts(m.opts, m.sub);
-      opts.onConnection = (conn) => post({ t: "event", sub: m.sub, kind: "connection", conn: connInfo(conn) });
+      // Only a callback the page gave: tailcatListen refuses a listener
+      // without one, as it does on the page.
+      if (m.opts.onConnection) {
+        opts.onConnection = (conn) => post({ t: "event", sub: m.sub, kind: "connection", conn: connInfo(conn) });
+      } else {
+        delete opts.onConnection;
+      }
       const ln = await self.tailcatListen(opts);
       return { value: { listener: keep(ln), addr: ln.addr, privateKeyJSON: ln.privateKeyJSON } };
     }

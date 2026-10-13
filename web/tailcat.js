@@ -280,9 +280,17 @@
         return {
           addr: v.addr,
           privateKeyJSON: v.privateKeyJSON,
+          // As on the page (main_js.go), close and disconnect never reject: a
+          // listener the Worker has closed already, or a Worker that has
+          // stopped, has nothing left to close or drop.
           disconnect: (peerKey, o) =>
-            this.call({ fn: "disconnect", obj, args: o ? [peerKey, { block: !!o.block }] : [peerKey] }),
-          close: () => this.call({ fn: "close", obj }).finally(() => this.subs.delete(sub)),
+            this.call({ fn: "disconnect", obj, args: o ? [peerKey, { block: !!o.block }] : [peerKey] }).catch(
+              () => false,
+            ),
+          close: () =>
+            this.call({ fn: "close", obj })
+              .finally(() => this.subs.delete(sub))
+              .catch(() => undefined),
         };
       } catch (err) {
         this.subs.delete(sub);
@@ -366,17 +374,23 @@
           return this.call({ fn: "write", obj, args: [copy] }, [copy.buffer]);
         },
         closeWrite: () => this.call({ fn: "closeWrite", obj }),
+        // Never rejects, as on the page: see the listener's close.
         close: () => {
+          // What was read ahead and not read is dropped, and so is what
+          // arrives from here on (onData).
           st.closed = true;
-          return this.call({ fn: "close", obj }).finally(() => {
-            this.conns.delete(obj);
-            if (sub) {
-              this.subs.delete(sub);
-            }
-            // A read still waiting fails, as it would on the closed conn.
-            st.error = st.error || new Error("read on a closed conn");
-            st.feed();
-          });
+          st.chunks = [];
+          return this.call({ fn: "close", obj })
+            .finally(() => {
+              this.conns.delete(obj);
+              if (sub) {
+                this.subs.delete(sub);
+              }
+              // A read still waiting fails, as it would on the closed conn.
+              st.error = st.error || new Error("read on a closed conn");
+              st.feed();
+            })
+            .catch(() => undefined);
         },
       };
     }
@@ -385,7 +399,7 @@
     // or the error that ended it.
     onData(m) {
       const st = this.conns.get(m.conn);
-      if (!st) {
+      if (!st || st.closed) {
         return; // closed here
       }
       if (m.data) {

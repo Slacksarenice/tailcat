@@ -969,6 +969,35 @@ func TestBrowserCloseDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestBrowserListenRequiresOnConnection checks that tailcatListen refuses
+// a listener with no onConnection in a Worker, as it does on the page:
+// one would take connections no one reads.
+func TestBrowserListenRequiresOnConnection(t *testing.T) {
+	bin := preflight(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	browserCtx := launchChrome(t, bin)
+	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
+	t.Cleanup(cancelRun)
+
+	var ready bool
+	var got string
+	if err := chromedp.Run(runCtx,
+		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
+			chromedp.WithPollingTimeout(60*time.Second)),
+		chromedp.Evaluate(`tailcatListen({derpMapURL: location.origin + "/derpmap.json"}).then(() => "resolved", (e) => String(e))`, &got,
+			func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams { return p.WithAwaitPromise(true) }),
+	); err != nil {
+		t.Fatalf("chromedp run: %v", err)
+	}
+	if !strings.Contains(got, "onConnection") {
+		t.Errorf("tailcatListen with no onConnection gave %q; want a rejection naming onConnection", got)
+	}
+	checkPageErrors(t, runCtx)
+}
+
 // TestBrowserDialBadAddrDoesNotBlock dials two addresses no client can
 // use and checks that the page keeps running. One doesn't parse, and is
 // refused at once. The other, a legacy address, parses, but its client
