@@ -387,8 +387,10 @@
         write: (data) => {
           // A copy of just these bytes moves to the Worker: posting the
           // view itself would copy all of its buffer, and leave the
-          // caller's, which it may reuse, alone only at that cost.
-          const copy = data.slice();
+          // caller's, which it may reuse, alone only at that cost. A plain
+          // Uint8Array of its own: a subclass's slice() can return a view
+          // (a Buffer's does), whose transfer would empty the caller's.
+          const copy = new Uint8Array(data);
           return this.call({ fn: "write", obj, args: [copy] }, [copy.buffer]);
         },
         closeWrite: () => this.call({ fn: "closeWrite", obj }),
