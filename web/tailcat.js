@@ -221,13 +221,12 @@
     }
 
     // die ends this instance: its calls reject, its peer connections
-    // close, and its Worker stops.
+    // close, its Worker stops, and exited rejects with err.
     die(err) {
       if (this.dead) {
         return;
       }
       this.dead = err;
-      console.error(err);
       for (const c of this.calls.values()) {
         c.reject(err);
       }
