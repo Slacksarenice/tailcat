@@ -982,18 +982,24 @@ func TestBrowserListenRequiresOnConnection(t *testing.T) {
 	t.Cleanup(cancelRun)
 
 	var ready bool
-	var got string
+	var none, notFunc string
+	listen := func(extra string, got *string) chromedp.Action {
+		return chromedp.Evaluate(`tailcatListen({derpMapURL: location.origin + "/derpmap.json"`+extra+`}).then(() => "resolved", (e) => String(e))`, got,
+			func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams { return p.WithAwaitPromise(true) })
+	}
 	if err := chromedp.Run(runCtx,
 		chromedp.Navigate(srv.URL+"/"),
 		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
 			chromedp.WithPollingTimeout(60*time.Second)),
-		chromedp.Evaluate(`tailcatListen({derpMapURL: location.origin + "/derpmap.json"}).then(() => "resolved", (e) => String(e))`, &got,
-			func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams { return p.WithAwaitPromise(true) }),
+		listen("", &none),
+		listen(", onConnection: true", &notFunc),
 	); err != nil {
 		t.Fatalf("chromedp run: %v", err)
 	}
-	if !strings.Contains(got, "onConnection") {
-		t.Errorf("tailcatListen with no onConnection gave %q; want a rejection naming onConnection", got)
+	for _, got := range []string{none, notFunc} {
+		if !strings.Contains(got, "onConnection") {
+			t.Errorf("tailcatListen with no onConnection function gave %q; want a rejection naming onConnection", got)
+		}
 	}
 	checkPageErrors(t, runCtx)
 }

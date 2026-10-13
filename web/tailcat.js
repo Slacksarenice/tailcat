@@ -83,7 +83,19 @@
     });
   }
 
-  async function startOnPage(module, base) {
+  // pageStarts orders starts on the page: each instance there tells of its
+  // start through the one global onTailcatReady, and defines the same
+  // globals, so each must be ready, and have taken its API, before the next
+  // begins.
+  let pageStarts = Promise.resolve();
+
+  function startOnPage(module, base) {
+    const start = pageStarts.then(() => startOnPageNow(module, base));
+    pageStarts = start.catch(() => {});
+    return start;
+  }
+
+  async function startOnPageNow(module, base) {
     if (typeof Go === "undefined") {
       await loadScript(base + "wasm_exec.js");
     }
@@ -182,12 +194,18 @@
     };
   }
 
-  // plainOpts returns opts as a Worker can receive them: each callback
-  // replaced by true, which the Worker answers with events.
+  // plainOpts returns opts as a Worker can receive them: each callback (an
+  // "on..." option) that is a function replaced by true, which the Worker
+  // answers with events, and one that isn't left out, as tailcatListen and
+  // tailcatDial would ignore or refuse it.
   function plainOpts(opts) {
     const o = {};
     for (const [k, v] of Object.entries(opts || {})) {
-      o[k] = typeof v === "function" ? true : v;
+      if (k.startsWith("on")) {
+        if (typeof v === "function") o[k] = true;
+        continue;
+      }
+      o[k] = v;
     }
     return o;
   }
@@ -454,13 +472,13 @@
 
     onEvent(m) {
       const s = this.subs.get(m.sub);
-      if (m.kind === "connection" && !s) {
-        // Its listener is closing.
-        this.call({ fn: "close", obj: m.conn.conn }).catch(() => {});
-        return;
-      }
       const f = s && s[m.kind];
       if (typeof f !== "function") {
+        // A connection no one takes (its listener is closing) is closed,
+        // or the Worker would keep it, waiting for its reads.
+        if (m.kind === "connection") {
+          this.call({ fn: "close", obj: m.conn.conn }).catch(() => {});
+        }
         return;
       }
       try {
