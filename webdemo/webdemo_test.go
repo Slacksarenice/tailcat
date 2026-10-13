@@ -16,6 +16,8 @@ func fakeDist() fstest.MapFS {
 	return fstest.MapFS{
 		"index.html":    {Data: []byte("<html>demo</html>")},
 		"app.js":        {Data: []byte("// app")},
+		"tailcat.js":    {Data: []byte("// start")},
+		"worker.js":     {Data: []byte("// worker")},
 		"wasm_exec.js":  {Data: []byte("// exec")},
 		"main.wasm":     {Data: []byte("wasm-uncompressed")},
 		"main.wasm.zst": {Data: []byte("wasm-zst")},
@@ -24,10 +26,12 @@ func fakeDist() fstest.MapFS {
 }
 
 func TestHandlerIncompleteDist(t *testing.T) {
-	dist := fakeDist()
-	delete(dist, "main.wasm")
-	if _, err := Handler(dist); err == nil {
-		t.Fatal("Handler succeeded with incomplete dist; want error")
+	for _, name := range []string{"main.wasm", "worker.js"} {
+		dist := fakeDist()
+		delete(dist, name)
+		if _, err := Handler(dist); err == nil {
+			t.Errorf("Handler succeeded with a dist missing %s; want error", name)
+		}
 	}
 }
 
@@ -66,6 +70,8 @@ func TestHandler(t *testing.T) {
 	}{
 		{path: "/", wantBody: "<html>demo</html>"},
 		{path: "/app.js", wantBody: "// app"},
+		{path: "/tailcat.js", wantBody: "// start"},
+		{path: "/worker.js", wantBody: "// worker"},
 		{path: "/wasm_exec.js", wantBody: "// exec"},
 		{
 			path: "/main.wasm", ae: "zstd, gzip", wantBody: "wasm-zst",

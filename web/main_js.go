@@ -2,24 +2,27 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The tailcat web app is the WebAssembly (js/wasm) build of tailcat
-// for browsers. It exposes two global JavaScript functions,
-// tailcatListen and tailcatDial, that app.js uses to implement
-// file sharing. The browser reaches DERP relays over WebSockets,
+// for browsers. It defines two global JavaScript functions,
+// tailcatListen and tailcatDial, where it runs: in a dedicated Worker
+// (worker.js), where tailcat.js starts it if the browser allows, or on
+// the page. Either way tailcat.js hands the page an API that calls
+// them, which app.js uses to implement file sharing. The browser
+// reaches DERP relays over WebSockets,
 // which tailscale.com's derphttp package does automatically under
 // GOOS=js. When both ends of a tunnel are this app and enable the
 // "webrtc" option, the tunnel's traffic moves to a direct WebRTC
 // DataChannel between the browsers whenever one can be opened, and
 // back to DERP if it fails; see webrtc_js.go.
 //
-// A function the page calls runs on the page's event loop, which the
-// call holds until it returns. Anything that can wait on the network
-// therefore runs on a goroutine and hands the page a Promise: closing a
-// node, say, waits for its in-flight fetches and WebSockets to end, and
-// those can only end on the event loop, so waiting for them in the
-// call itself would freeze the page. A goroutine holds it too, for as
-// long as it runs without blocking: Go hands the thread back to the
-// page only once every goroutine waits on something. So no loop may
-// retry without waiting between attempts.
+// A function JavaScript calls runs on the event loop of the scope it
+// runs in, the Worker's or the page's, which the call holds until it
+// returns. Anything that can wait on the network therefore runs on a
+// goroutine and hands back a Promise: closing a node, say, waits for
+// its in-flight fetches and WebSockets to end, and those can only end
+// on the event loop, so waiting for them in the call itself would
+// freeze it. A goroutine holds it too, for as long as it runs without
+// blocking: Go hands the thread back only once every goroutine waits on
+// something. So no loop may retry without waiting between attempts.
 package main
 
 import (

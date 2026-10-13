@@ -258,13 +258,25 @@ func logConsole(t *testing.T, ctx context.Context, name string) {
 func checkPageErrors(t *testing.T, runCtx context.Context) {
 	t.Helper()
 	var pageErrors []string
+	var mode, search string
 	if err := chromedp.Run(runCtx,
 		chromedp.Evaluate("window.tcTest.errors", &pageErrors),
+		chromedp.Evaluate("String(window.tcTest.mode)", &mode),
+		chromedp.Evaluate("location.search", &search),
 	); err != nil {
 		t.Fatalf("chromedp evaluate errors: %v", err)
 	}
 	for _, e := range pageErrors {
 		t.Errorf("page error: %s", e)
+	}
+	// tailcat runs in a Worker, unless the page asked for it on the
+	// page, or the browser couldn't (tailcat.js), which Chrome can.
+	want := "worker"
+	if q, _ := url.ParseQuery(strings.TrimPrefix(search, "?")); q.Get("worker") == "0" {
+		want = "page"
+	}
+	if mode != want {
+		t.Errorf("tailcat ran in %s mode; want %s", mode, want)
 	}
 }
 
@@ -524,6 +536,9 @@ func TestBrowserSendKeepsNoCopy(t *testing.T) {
 			"addr":  {string(s.TailcatAddr())},
 			"bytes": {strconv.Itoa(size)},
 			"gate":  {""},
+			// On the page, where wasmMemScript sees the module's memory.
+			// The Go side it checks is the same in a Worker.
+			"worker": {"0"},
 		}.Encode()),
 		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ok,
 			chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(120*time.Second)),
@@ -850,25 +865,42 @@ func (p *tabPair) checkTransferOf(size int) {
 // TestBrowserToBrowserWebRTC has one tab listen and another dial it,
 // both with WebRTC enabled, waits for their tunnel to move to a
 // direct WebRTC path, then stops the DERP server before sending: the
-// transfer can only complete over WebRTC.
+// transfer can only complete over WebRTC. Each tab runs tailcat in a
+// Worker, as every test does unless it says otherwise.
 func TestBrowserToBrowserWebRTC(t *testing.T) {
+	testBrowserToBrowserWebRTC(t, nil)
+}
+
+// TestBrowserToBrowserWebRTCOnPage is TestBrowserToBrowserWebRTC with
+// tailcat on each page, as in a browser that can't hand a Worker a
+// DataChannel.
+func TestBrowserToBrowserWebRTCOnPage(t *testing.T) {
+	testBrowserToBrowserWebRTC(t, url.Values{"worker": {"0"}})
+}
+
+func testBrowserToBrowserWebRTC(t *testing.T, extra url.Values) {
 	p := newTabPair(t)
 	dm, stopDERP := runStoppableDERP(t)
 	srv := newWebServer(t, dm)
 
-	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}})
+	listenQ := url.Values{"webrtc": {"host"}}
+	sendQ := url.Values{
+		"mode":     {"send"},
+		"bytes":    {strconv.Itoa(transferSize)},
+		"webrtc":   {"host"},
+		"waitpath": {"webrtc"},
+		"gate":     {""},
+	}
+	for k, v := range extra {
+		listenQ[k], sendQ[k] = v, v
+	}
+	addr := p.listenTab(srv, listenQ)
 	t.Logf("listener at %v", addr)
+	sendQ.Set("addr", addr)
 
 	p.send = newTab(t, p.listen, "sender")
 	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
-		chromedp.Navigate(srv.URL+"/?"+withVerbose(url.Values{
-			"mode":     {"send"},
-			"addr":     {addr},
-			"bytes":    {strconv.Itoa(transferSize)},
-			"webrtc":   {"host"},
-			"waitpath": {"webrtc"},
-			"gate":     {""},
-		}).Encode()),
+		chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
 		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
 	)
 	p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second,
@@ -886,7 +918,9 @@ func TestBrowserToBrowserWebRTC(t *testing.T) {
 // TestBrowserCloseDoesNotBlock closes a listener the moment it is up,
 // while its first relay probes are still in flight, and checks that
 // the page keeps running. Waiting for those probes inside the call
-// would hold the event loop they need to end, freezing the page.
+// would hold the event loop they need to end, freezing the page. It
+// runs tailcat on the page, whose timers it counts: in a Worker, the
+// call would hold the Worker's event loop, which the page can't see.
 func TestBrowserCloseDoesNotBlock(t *testing.T) {
 	bin := preflight(t)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
@@ -898,7 +932,7 @@ func TestBrowserCloseDoesNotBlock(t *testing.T) {
 
 	var ready bool
 	if err := chromedp.Run(runCtx,
-		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Navigate(srv.URL+"/?worker=0"),
 		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
 			chromedp.WithPollingTimeout(60*time.Second)),
 	); err != nil {
@@ -939,7 +973,8 @@ func TestBrowserCloseDoesNotBlock(t *testing.T) {
 // use and checks that the page keeps running. One doesn't parse, and is
 // refused at once. The other, a legacy address, parses, but its client
 // fails to start on every attempt, without blocking: retrying that with
-// no pause would hold the page's thread until the dial timed out.
+// no pause would hold the page's thread until the dial timed out. Like
+// TestBrowserCloseDoesNotBlock, it runs tailcat on the page.
 func TestBrowserDialBadAddrDoesNotBlock(t *testing.T) {
 	bin := preflight(t)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
@@ -951,7 +986,7 @@ func TestBrowserDialBadAddrDoesNotBlock(t *testing.T) {
 
 	var ready bool
 	if err := chromedp.Run(runCtx,
-		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Navigate(srv.URL+"/?worker=0"),
 		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
 			chromedp.WithPollingTimeout(60*time.Second)),
 	); err != nil {
@@ -1318,8 +1353,11 @@ var stressDelay = flag.Duration("web-stress-rtt", 0,
 var stressHide = flag.String("web-stress-hide", "",
 	`TestBrowserWebRTCStress: "send" or "listen" runs that side's browser in a window, minimized during the transfer, with Chrome's throttling of hidden pages on`)
 
+var stressOnPage = flag.Bool("web-stress-on-page", false,
+	"TestBrowserWebRTCStress: run tailcat on each page (?worker=0) rather than in a Worker, to compare")
+
 var stressProfile = flag.String("web-stress-profile", "",
-	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory")
+	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory. It profiles the page's thread, which holds the tunnel's work only with --web-stress-on-page")
 
 // startProfile starts the CPU profiler of the page of ctx, sampling
 // every 100µs.
@@ -1405,22 +1443,28 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	srv := newWebServer(t, dm)
 
 	delay := strconv.Itoa(int(stressDelay.Milliseconds() / 2)) // each side holds what it receives
-	addr := p.listenTab(srv, url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}})
+	listenQ := url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}}
+	sendQ := url.Values{
+		"mode":     {"send"},
+		"bytes":    {strconv.Itoa(size)},
+		"pattern":  {""},
+		"webrtc":   {"host"},
+		"waitpath": {"webrtc"},
+		"gate":     {""},
+		"hooks":    {""},
+		"timeline": {""},
+		"delay":    {delay},
+	}
+	if *stressOnPage {
+		listenQ.Set("worker", "0")
+		sendQ.Set("worker", "0")
+	}
+	addr := p.listenTab(srv, listenQ)
+	sendQ.Set("addr", addr)
 	p.send = launchChrome(t, bin, opts["send"]...)
 	allocate(t, p.send)
 	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
-		chromedp.Navigate(srv.URL+"/?"+withVerbose(url.Values{
-			"mode":     {"send"},
-			"addr":     {addr},
-			"bytes":    {strconv.Itoa(size)},
-			"pattern":  {""},
-			"webrtc":   {"host"},
-			"waitpath": {"webrtc"},
-			"gate":     {""},
-			"hooks":    {""},
-			"timeline": {""},
-			"delay":    {delay},
-		}).Encode()),
+		chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
 		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
 	)
 	p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second, poll(`window.tcTest.path === "webrtc"`))

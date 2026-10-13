@@ -16,13 +16,13 @@ import (
 )
 
 // distFiles are the files a dist FS must contain.
-var distFiles = []string{"index.html", "app.js", "wasm_exec.js", "main.wasm"}
+var distFiles = []string{"index.html", "app.js", "tailcat.js", "worker.js", "wasm_exec.js", "main.wasm"}
 
 // Handler returns an HTTP handler serving the web app from dist, a
 // filesystem containing the files built by wasmbuild.Dist: index.html
-// at "/", app.js, wasm_exec.js, and main.wasm, the latter served
-// precompressed (from main.wasm.zst or main.wasm.gz, if present in
-// dist) when the client's Accept-Encoding allows.
+// at "/", app.js, tailcat.js, worker.js, wasm_exec.js, and main.wasm,
+// the latter served precompressed (from main.wasm.zst or main.wasm.gz,
+// if present in dist) when the client's Accept-Encoding allows.
 //
 // The page's asset URLs are all relative, so the handler may be
 // mounted under a path prefix with http.StripPrefix.
@@ -45,12 +45,11 @@ func Handler(dist fs.FS) (http.Handler, error) {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, dist, "index.html")
 	})
-	mux.HandleFunc("GET /app.js", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, dist, "app.js")
-	})
-	mux.HandleFunc("GET /wasm_exec.js", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, dist, "wasm_exec.js")
-	})
+	for _, name := range []string{"app.js", "tailcat.js", "worker.js", "wasm_exec.js"} {
+		mux.HandleFunc("GET /"+name, func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFileFS(w, r, dist, name)
+		})
+	}
 	mux.HandleFunc("GET /main.wasm", func(w http.ResponseWriter, r *http.Request) {
 		// The wasm binary is tens of MB; serve it precompressed.
 		// Content-Type is set before ServeFileFS so it isn't sniffed

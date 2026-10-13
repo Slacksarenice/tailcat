@@ -68,9 +68,9 @@ func Build(pkgDir, outPath string) error {
 // Dist builds the complete set of static files a server needs to
 // serve the web app: main.wasm (compiled from the Go package in
 // webDir, with precompressed main.wasm.zst and main.wasm.gz
-// variants), the toolchain's wasm_exec.js, and index.html and app.js
-// copied from webDir. It writes them all to outDir, creating it if
-// needed.
+// variants), the toolchain's wasm_exec.js, and index.html, app.js,
+// tailcat.js and worker.js copied from webDir. It writes them all to
+// outDir, creating it if needed.
 func Dist(webDir, outDir string) error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
@@ -93,7 +93,7 @@ func Dist(webDir, outDir string) error {
 	if err := copyFile(wasmExecJS, filepath.Join(outDir, "wasm_exec.js")); err != nil {
 		return err
 	}
-	for _, name := range []string{"index.html", "app.js"} {
+	for _, name := range []string{"index.html", "app.js", "tailcat.js", "worker.js"} {
 		if err := copyFile(filepath.Join(webDir, name), filepath.Join(outDir, name)); err != nil {
 			return err
 		}

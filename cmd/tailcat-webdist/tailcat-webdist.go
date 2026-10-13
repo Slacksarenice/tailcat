@@ -3,10 +3,10 @@
 
 // The tailcat-webdist command builds the distribution directory of
 // static files needed to serve the tailcat browser app: index.html,
-// app.js, wasm_exec.js, and the js/wasm main.wasm binary with
-// precompressed .zst and .gz variants. Servers such as
-// cmd/tailcat-web and tailcat.dev's tailcatmd serve the result via
-// the webdemo package.
+// app.js, tailcat.js, worker.js, wasm_exec.js, and the js/wasm
+// main.wasm binary with precompressed .zst and .gz variants. Servers
+// such as cmd/tailcat-web and tailcat.dev's tailcatmd serve the result
+// via the webdemo package.
 //
 // With -modfile instead of -o, it writes the go.mod that the wasm build
 // uses, whose tailscale.com carries the magicsock packet path hook,

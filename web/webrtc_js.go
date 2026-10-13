@@ -411,7 +411,7 @@ type rtcSession struct {
 
 func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic, signal net.Conn, iceServers js.Value, notify pathNotifier,
 	stats pathStatsFunc, newPath func(send func([]byte) bool) (*tailcat.PacketPath, error), offerer bool) (*rtcSession, error) {
-	ctor := js.Global().Get("RTCPeerConnection")
+	ctor := peerConnectionCtor()
 	if ctor.Type() != js.TypeFunction {
 		return nil, errors.New("this browser has no RTCPeerConnection")
 	}
@@ -559,6 +559,29 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 		s.teardown()
 	}()
 	return s, nil
+}
+
+// peerConnectionCtor returns the RTCPeerConnection constructor. A Worker
+// has none: there it is worker.js's stand-in, tailcatPeerConnection,
+// whose connections the page holds (tailcat.js) and whose DataChannels
+// it hands to the Worker as it creates them, so that the tunnel's
+// datagrams don't cross the page's thread.
+func peerConnectionCtor() js.Value {
+	if c := js.Global().Get("tailcatPeerConnection"); c.Type() == js.TypeFunction {
+		return c
+	}
+	return js.Global().Get("RTCPeerConnection")
+}
+
+// createDataChannel creates a DataChannel on the session's peer
+// connection. The stand-in of a Worker (see peerConnectionCtor) returns
+// a Promise of it: the page creates the channel and hands it over.
+func (s *rtcSession) createDataChannel(label string, opts map[string]any) (js.Value, error) {
+	ch, err := jsCall(s.pc, "createDataChannel", label, opts)
+	if err != nil || ch.Type() != js.TypeObject || ch.Get("then").Type() != js.TypeFunction {
+		return ch, err
+	}
+	return awaitPromise(s.ctx, ch)
 }
 
 // on sets an event handler property, remembering it for release. A
@@ -737,7 +760,7 @@ func (s *rtcSession) addCandidate(c json.RawMessage) {
 // offer creates the DataChannels and sends an offer; the dialer calls
 // it.
 func (s *rtcSession) offer() error {
-	dc, err := jsCall(s.pc, "createDataChannel", dataChannelName, map[string]any{
+	dc, err := s.createDataChannel(dataChannelName, map[string]any{
 		"ordered": false,
 		// SCTP splits datagrams larger than its path MTU into
 		// fragments; a couple of retransmissions repair a lost
@@ -752,7 +775,7 @@ func (s *rtcSession) offer() error {
 	// Reliable and ordered: a ping is tiny, and one lost is repaired
 	// rather than counted against the path. "high" asks browsers that
 	// weigh channels to send it ahead of the datagrams.
-	if ctl, err := jsCall(s.pc, "createDataChannel", ctlChannelName, map[string]any{
+	if ctl, err := s.createDataChannel(ctlChannelName, map[string]any{
 		"priority": "high",
 	}); err == nil {
 		s.attachControl(ctl)
@@ -1657,7 +1680,7 @@ func watchListenerNetwork(srv *tailcat.Server, rtc *rtcServer) (stop func()) {
 }
 
 // netWatch passes the browser's reports that the network may have
-// changed on to the tunnels that subscribe: the window's online event,
+// changed on to the tunnels that subscribe: the page's online event,
 // and a change in navigator.connection's type, where the browser
 // reports one (Chrome on Android, not on desktops). A report less than
 // minNetChangeGap after the last is held until the gap has passed.
@@ -1715,8 +1738,14 @@ func addNetListenersLocked() {
 			f.Release()
 		})
 	}
-	listen(js.Global(), "online", netChanged)
-	nav := js.Global().Get("navigator")
+	target, nav := js.Global(), js.Global().Get("navigator")
+	if fwd := js.Global().Get("tailcatNetwork"); fwd.Type() == js.TypeObject {
+		// In a Worker (worker.js): the page's online events and its
+		// navigator.connection's changes, which tailcat.js forwards. The
+		// Worker's own would report each change a second time.
+		target, nav = fwd, fwd
+	}
+	listen(target, "online", netChanged)
 	if nav.Type() != js.TypeObject {
 		return
 	}
