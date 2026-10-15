@@ -135,30 +135,47 @@ func summarize(dir string) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Println("variant  path     rtt  n stalled  steady MB/s        t50 s              t90 s              t10MB s            t20MB s            overall MB/s       WebRTC at s")
+	// Times are medians (and ranges) over the runs that reached the rate
+	// at all, with how many did; a stall is 2 s or more with nothing
+	// received.
+	fmt.Println("variant  path     rtt  n | overall MB/s       | steady MB/s        | to 10 MB/s, s         | to 20 MB/s, s         | stalled runs, s in all | WebRTC at s")
 	for _, k := range keys {
 		ms := groups[k]
 		col := func(f func(rampmetric.Metrics) float64) string {
 			var v []float64
 			for _, m := range ms {
-				v = append(v, f(m))
+				if x := f(m); x >= 0 {
+					v = append(v, x)
+				}
+			}
+			if len(v) == 0 {
+				return fmt.Sprintf("%18s", "-")
 			}
 			slices.Sort(v)
 			return fmt.Sprintf("%5.1f (%5.1f–%5.1f)", v[len(v)/2], v[0], v[len(v)-1])
 		}
-		stalled := 0
+		reached := func(f func(rampmetric.Metrics) float64) string {
+			n := 0
+			for _, m := range ms {
+				if f(m) >= 0 {
+					n++
+				}
+			}
+			return fmt.Sprintf("%d/%d %s", n, len(ms), col(f))
+		}
+		stalled, secs := 0, 0.0
 		for _, m := range ms {
 			if m.Stalls > 0 {
 				stalled++
 			}
+			secs += m.StalledSecs
 		}
-		fmt.Printf("%s %2d %7d %s %s %s %s %s %s %s\n", k, len(ms), stalled,
-			col(func(m rampmetric.Metrics) float64 { return m.Steady }),
-			col(func(m rampmetric.Metrics) float64 { return m.T50 }),
-			col(func(m rampmetric.Metrics) float64 { return m.T90 }),
-			col(func(m rampmetric.Metrics) float64 { return m.T10 }),
-			col(func(m rampmetric.Metrics) float64 { return m.T20 }),
+		fmt.Printf("%s %2d | %s | %s | %s | %s | %d, %6.1f s | %s\n", k, len(ms),
 			col(func(m rampmetric.Metrics) float64 { return m.Total }),
+			col(func(m rampmetric.Metrics) float64 { return m.Steady }),
+			reached(func(m rampmetric.Metrics) float64 { return m.T10 }),
+			reached(func(m rampmetric.Metrics) float64 { return m.T20 }),
+			stalled, secs,
 			col(func(m rampmetric.Metrics) float64 { return m.Switch }))
 	}
 }
