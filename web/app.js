@@ -1,5 +1,6 @@
-// tailcat web app. Plain JavaScript, no build step. The Go side
-// (main_js.go) exposes globals tailcatListen and tailcatDial.
+// tailcat web app. Plain JavaScript, no build step. tailcat.js starts
+// the Go side (main_js.go), in a Worker where the browser allows, and
+// the page calls it through the globals tailcatListen and tailcatDial.
 
 const CHUNK = 64 * 1024;
 const KEY_STORAGE = "tailcat-web-key";
@@ -24,6 +25,7 @@ window.tcTest = {
   pathsAtDone: null, // paths as they stood when this side's transfer completed
   stats: null, // the last onPathStats report
   go: false,  // with ?gate, the sender waits for the test to set this
+  mode: null, // where tailcat runs: "worker", or "page" (with ?worker=0)
   errors: [],
 };
 window.addEventListener("error", (e) => window.tcTest.errors.push(String(e.message)));
@@ -176,12 +178,17 @@ async function fetchWasm() {
   return new Response(counted, { headers: { "Content-Type": "application/wasm" } });
 }
 
-// Boot the wasm module.
-const ready = new Promise((resolve) => { globalThis.onTailcatReady = resolve; });
-const go = new Go();
-WebAssembly.instantiateStreaming(fetchWasm(), go.importObject)
-  .then(({ instance }) => go.run(instance));
-await ready;
+// Boot the wasm module: in a Worker where the browser allows, or on the
+// page with ?worker=0. tailcatListen and tailcatDial are the started
+// instance's, wherever it runs.
+const tc = await tailcatStart({
+  wasm: fetchWasm(),
+  worker: params.get("worker") === "0" ? false : "auto",
+});
+globalThis.tailcatListen = tc.listen;
+globalThis.tailcatDial = tc.dial;
+tc.exited.catch((err) => window.tcTest.errors.push(String(err)));
+window.tcTest.mode = tc.mode;
 window.tcTest.ready = true;
 $("load-progress").remove();
 setStatus("Ready.");
