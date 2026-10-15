@@ -20,19 +20,9 @@ import (
 	"slices"
 	"sort"
 	"strings"
-)
 
-type metrics struct {
-	Steady float64 `json:"steadyMBps"`
-	T50    float64 `json:"t50"`
-	T90    float64 `json:"t90"`
-	Switch float64 `json:"switch"`
-	Total  float64 `json:"totalMBps"`
-	// Stalls of 2 s or more; the ramp is measured before the first.
-	Stalls      int
-	StallAt     float64
-	StalledSecs float64
-}
+	"github.com/tailscale/tailcat/web/stressbench/rampmetric"
+)
 
 type tcpConn struct {
 	LPort, RPort       uint16
@@ -63,6 +53,7 @@ type tcpSample struct {
 
 type rtcSample struct {
 	T                                    int64
+	Session                              int
 	Up                                   bool
 	Buffered, Line                       int
 	Rate                                 float64
@@ -71,9 +62,7 @@ type rtcSample struct {
 }
 
 type side struct {
-	Ramp []struct {
-		T, Sent, Recv int64
-	}
+	Ramp       []rampmetric.Point
 	PathEvents []struct {
 		T    int64
 		Path string
@@ -89,9 +78,20 @@ type trace struct {
 	RelayMs float64
 	CC      string
 	Variant string
-	Metrics metrics
 	Listen  side
 	Send    side
+}
+
+// metrics measures t's ramp afresh from its pages' progress.
+func (t *trace) metrics() rampmetric.Metrics {
+	m := rampmetric.Compute(t.Listen.Ramp, t.Send.SendStart)
+	for _, e := range t.Send.PathEvents {
+		if e.Path == "webrtc" {
+			m.Switch = float64(e.T-t.Send.SendStart) / 1e3
+			break
+		}
+	}
+	return m
 }
 
 func load(path string) (*trace, error) {
@@ -120,7 +120,7 @@ func main() {
 
 func summarize(dir string) {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
-	groups := map[string][]metrics{}
+	groups := map[string][]rampmetric.Metrics{}
 	for _, f := range files {
 		t, err := load(f)
 		if err != nil {
@@ -128,17 +128,17 @@ func summarize(dir string) {
 			continue
 		}
 		k := fmt.Sprintf("%-8s %-6s %3.0fms", t.Variant, t.Path, t.NetemMs+t.RelayMs)
-		groups[k] = append(groups[k], t.Metrics)
+		groups[k] = append(groups[k], t.metrics())
 	}
 	keys := make([]string, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Println("variant  path     rtt  n stalled  steady MB/s        t50 s              t90 s              overall MB/s       WebRTC at s")
+	fmt.Println("variant  path     rtt  n stalled  steady MB/s        t50 s              t90 s              t10MB s            t20MB s            overall MB/s       WebRTC at s")
 	for _, k := range keys {
 		ms := groups[k]
-		col := func(f func(metrics) float64) string {
+		col := func(f func(rampmetric.Metrics) float64) string {
 			var v []float64
 			for _, m := range ms {
 				v = append(v, f(m))
@@ -152,12 +152,14 @@ func summarize(dir string) {
 				stalled++
 			}
 		}
-		fmt.Printf("%s %2d %7d %s %s %s %s %s\n", k, len(ms), stalled,
-			col(func(m metrics) float64 { return m.Steady }),
-			col(func(m metrics) float64 { return m.T50 }),
-			col(func(m metrics) float64 { return m.T90 }),
-			col(func(m metrics) float64 { return m.Total }),
-			col(func(m metrics) float64 { return m.Switch }))
+		fmt.Printf("%s %2d %7d %s %s %s %s %s %s %s\n", k, len(ms), stalled,
+			col(func(m rampmetric.Metrics) float64 { return m.Steady }),
+			col(func(m rampmetric.Metrics) float64 { return m.T50 }),
+			col(func(m rampmetric.Metrics) float64 { return m.T90 }),
+			col(func(m rampmetric.Metrics) float64 { return m.T10 }),
+			col(func(m rampmetric.Metrics) float64 { return m.T20 }),
+			col(func(m rampmetric.Metrics) float64 { return m.Total }),
+			col(func(m rampmetric.Metrics) float64 { return m.Switch }))
 	}
 }
 
@@ -179,8 +181,9 @@ func dataConn(s tcpSample, sent bool) int {
 
 func printTimeline(t *trace, until float64) {
 	t0 := t.Send.SendStart
+	m := t.metrics()
 	fmt.Printf("%s %s, %.0f ms, cc %q: steady %.1f MB/s, t50 %.2f s, t90 %.2f s, WebRTC from %.2f s\n",
-		t.Variant, t.Path, t.NetemMs+t.RelayMs, t.CC, t.Metrics.Steady, t.Metrics.T50, t.Metrics.T90, t.Metrics.Switch)
+		t.Variant, t.Path, t.NetemMs+t.RelayMs, t.CC, m.Steady, m.T50, m.T90, m.Switch)
 	for _, e := range t.Send.PathEvents {
 		fmt.Printf("sender path %s at %.2f s\n", e.Path, float64(e.T-t0)/1e3)
 	}
@@ -195,13 +198,23 @@ func printTimeline(t *trace, until float64) {
 		return 0
 	}
 	rtcAt := func(ms int64) (rtcSample, rtcSample, bool) {
+		// The latest session's sample at ms, and that session's one before.
 		r := t.Send.RTC
-		for i := 1; i < len(r); i++ {
-			if r[i].T >= ms-125 {
-				return r[i], r[i-1], true
+		at := -1
+		for i := range r {
+			if r[i].T <= ms+125 && (at < 0 || r[i].Session >= r[at].Session) {
+				at = i
 			}
 		}
-		return rtcSample{}, rtcSample{}, false
+		if at < 0 {
+			return rtcSample{}, rtcSample{}, false
+		}
+		for j := at - 1; j >= 0; j-- {
+			if r[j].Session == r[at].Session {
+				return r[at], r[j], true
+			}
+		}
+		return r[at], r[at], true
 	}
 	rcvBufAt := func(ms int64) (int64, int64) {
 		for _, s := range t.Listen.TCP {

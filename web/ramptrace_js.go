@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 )
@@ -27,6 +28,7 @@ const rampEvery = 250 * time.Millisecond
 
 type rampRTCSample struct {
 	T           int64   `json:"t"` // Unix ms
+	Session     int     `json:"session"` // which of the page's sessions, from 1: their counters start over
 	Up          bool    `json:"up"`
 	Buffered    int     `json:"buffered"`
 	Line        int     `json:"line"`
@@ -45,6 +47,13 @@ type rampRTCSample struct {
 	DCMsgSent float64 `json:"dcMsgs"`
 }
 
+// rampRTC holds the samples of every session on the page, in order.
+var rampRTC struct {
+	mu       sync.Mutex
+	sessions int
+	samples  []rampRTCSample
+}
+
 // traceRTC samples s while it lasts, if the page asked for a ramp trace
 // (tailcatTestHooks.ramp).
 func traceRTC(s *rtcSession) {
@@ -60,8 +69,20 @@ func traceRTC(s *rtcSession) {
 			s.logf("webrtc: %v", err)
 		}
 	}
+	// rampStuck replaces stuckAfter, for A/B runs; 0 never ends a session
+	// for a channel that stopped draining.
+	if v := s.hooks.Get("rampStuck"); v.Type() == js.TypeString && v.String() != "" {
+		if d, err := time.ParseDuration(v.String()); err == nil {
+			s.mu.Lock()
+			s.drain.StuckAfter = d
+			s.mu.Unlock()
+		}
+	}
+	rampRTC.mu.Lock()
+	rampRTC.sessions++
+	session := rampRTC.sessions
+	rampRTC.mu.Unlock()
 	go func() {
-		var samples []rampRTCSample
 		tick := time.NewTicker(rampEvery)
 		defer tick.Stop()
 		for n := 1; ; n++ {
@@ -73,6 +94,7 @@ func traceRTC(s *rtcSession) {
 			s.mu.Lock()
 			r := rampRTCSample{
 				T:           time.Now().UnixMilli(),
+				Session:     session,
 				Up:          s.qualified && !s.live.Suspect(),
 				Line:        s.shed.Limit(),
 				Rate:        s.shed.Rate(),
@@ -86,9 +108,14 @@ func traceRTC(s *rtcSession) {
 			}
 			s.mu.Unlock()
 			rampWireStats(s, &r)
-			samples = append(samples, r)
+			rampRTC.mu.Lock()
+			rampRTC.samples = append(rampRTC.samples, r)
+			var b []byte
 			if n%4 == 0 {
-				b, _ := json.Marshal(samples)
+				b, _ = json.Marshal(rampRTC.samples)
+			}
+			rampRTC.mu.Unlock()
+			if b != nil {
 				s.hooks.Set("rampRTC", string(b))
 			}
 		}

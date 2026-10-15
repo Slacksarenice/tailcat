@@ -48,6 +48,7 @@ if (params.has("hooks")) {
     window.tailcatTestHooks.rampCC = params.get("cc") || "";
     window.tailcatTestHooks.rampReliable = params.has("reliable");
     window.tailcatTestHooks.rampShed = params.get("shed") || "";
+    window.tailcatTestHooks.rampStuck = params.get("stuck") || "";
   }
   // ?relay has the test's delay relays stand between the pages (the
   // stress test's --web-stress-relay; ramp-trace builds only).

@@ -682,6 +682,35 @@ func TestShedderIdleRate(t *testing.T) {
 	}
 }
 
+func TestDrain(t *testing.T) {
+	d := &Drain{StuckAfter: 3 * time.Second}
+	steps := []struct {
+		at       float64
+		buffered int
+		sent     int64
+		want     bool
+	}{
+		{0, 0, 0, false},           // empty
+		{0.5, 1000, 1000, false},   // filling: nothing drained yet, but just began
+		{1, 500, 1500, false},      // drains 1000
+		{2, 2000, 3000, false},     // drains nothing, as more arrives
+		{3.9, 2000, 3000, false},   // still nothing: 2.9 s since it last drained
+		{4.1, 2500, 3500, true},    // 3.1 s
+		{4.5, 2500, 3500, true},    // still stuck
+		{5, 2400, 3500, false},     // drains 100: unstuck
+		{8.1, 2400, 3500, true},    // stuck again for 3.1 s
+		{8.5, 0, 3500, false},      // empty: nothing to send isn't stuck
+		{12, 0, 3500, false},       //
+		{12.5, 9000, 12500, false}, // a burst
+		{15.6, 9000, 12500, true},  //
+	}
+	for _, st := range steps {
+		if got := d.Stuck(st.buffered, st.sent, at(st.at)); got != st.want {
+			t.Errorf("at %vs, %d buffered after %d sent: Stuck = %v, want %v", st.at, st.buffered, st.sent, got, st.want)
+		}
+	}
+}
+
 func TestCheckDataOnly(t *testing.T) {
 	const head = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"
 	data := "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\n"

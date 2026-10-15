@@ -141,6 +141,15 @@ const (
 	shedEvery    = 100 * time.Millisecond
 	maxFrame     = frameHeaderLen + 65535
 
+	// A DataChannel that holds datagrams and sends none of them for
+	// stuckAfter (checked every drainCheckEvery) ends its session, though
+	// its pings may still be answered: after a burst loss at full speed,
+	// Chrome's SCTP has sent no data for most of a minute while its
+	// association, and the pings, carried on (see rtcpolicy.Drain).
+	// stuckAfter outlasts an SCTP retransmission timeout or two.
+	stuckAfter      = 3 * time.Second
+	drainCheckEvery = 500 * time.Millisecond
+
 	// qualifyTimeout is how long, from the start of signaling, a
 	// session may take to qualify its channel before either side gives
 	// up on it.
@@ -396,6 +405,7 @@ type rtcSession struct {
 	probeAcks      int
 	live           rtcpolicy.Liveness
 	shed           rtcpolicy.Shedder
+	drain          rtcpolicy.Drain
 	restarting     bool   // an ICE restart's offer is being made
 	restartAgain   string // why to restart ICE again once the offer under way is answered
 	remoteSet      bool
@@ -451,6 +461,7 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 			HardLimit:    hardBuffered,
 			Every:        shedEvery,
 		},
+		drain: rtcpolicy.Drain{StuckAfter: stuckAfter},
 	}
 	pc, err := func() (pc js.Value, err error) {
 		defer func() {
@@ -1294,10 +1305,28 @@ func (s *rtcSession) giveUpUnlessQualified() {
 func (s *rtcSession) watch() {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
+	d := time.NewTicker(drainCheckEvery)
+	defer d.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
+		case now := <-d.C:
+			s.mu.Lock()
+			stuck := false
+			if isOpen(s.dc) && s.drain.StuckAfter > 0 {
+				stuck = s.drain.Stuck(s.dc.Get("bufferedAmount").Int(), s.sentBytes, now)
+			}
+			s.mu.Unlock()
+			if stuck {
+				// The pings may still be answered; the session ends
+				// anyway, traffic goes over DERP, and the dialer
+				// negotiates a new one, whose SCTP starts afresh.
+				s.logf("webrtc: direct path to %v stopped sending what it is given; ending it", s.peer.ShortString())
+				s.countHook("stuck")
+				s.close()
+				return
+			}
 		case <-t.C:
 			// Not the tick's own time, which is when it was due: a tick
 			// the browser held back would then hide the gap from Tick and

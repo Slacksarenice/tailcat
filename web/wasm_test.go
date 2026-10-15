@@ -1411,6 +1411,9 @@ var stressNetem = flag.Duration("web-stress-netem", 0,
 var stressRelay = flag.Duration("web-stress-relay", 0,
 	"TestBrowserWebRTCStress: give both paths this round trip with the test's own delay relays (any OS; needs a ramp-trace build): each page's remote ICE candidates are rewritten to a UDP relay that forwards after half of it, and the pages reach DERP through a TCP proxy that holds each direction a quarter of it")
 
+var stressRelayBurst = flag.String("web-stress-relay-burst", "",
+	"TestBrowserWebRTCStress: with --web-stress-relay, AT:N has each relay drop the N data-sized datagrams it reads AT (a duration) after its first, to see how the path recovers from a burst loss")
+
 var stressJitter = flag.Duration("web-stress-jitter", 0,
 	"TestBrowserWebRTCStress: with --web-stress-netem or --web-stress-relay, vary each delay by up to this much, without reordering")
 
@@ -1422,6 +1425,15 @@ var stressTrace = flag.String("web-stress-trace", "",
 
 var stressReliable = flag.Bool("web-stress-reliable", false,
 	"TestBrowserWebRTCStress: with a ramp-trace build, open the datagrams' DataChannel reliable and ordered rather than unordered with two retransmissions, to diagnose the channel")
+
+var stressChromeLog = flag.String("web-stress-chrome-log", "",
+	"TestBrowserWebRTCStress: have each side's Chrome log verbosely (--enable-logging --v=1) to listen-chrome.log and send-chrome.log in this directory")
+
+var stressChromeLogSide = flag.String("web-stress-chrome-log-side", "",
+	`TestBrowserWebRTCStress: with --web-stress-chrome-log, only this side's Chrome logs ("listen" or "send"): logging every SCTP packet slows a Chrome down`)
+
+var stressStuck = flag.String("web-stress-stuck", "",
+	`TestBrowserWebRTCStress: with a ramp-trace build, how long a DataChannel may hold datagrams without sending any before its session ends (a duration; "0" never ends it)`)
 
 var stressShed = flag.String("web-stress-shed", "",
 	"TestBrowserWebRTCStress: with a ramp-trace build, tune both paths' Shedders, as rtcpolicy.Shedder.Tune takes it (warm=20,init=1048576)")
@@ -1548,6 +1560,18 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			opts[side] = append(opts[side], chromedp.Flag("force-webrtc-ip-handling-policy", "default_public_interface_only"))
 		}
 	}
+	if *stressChromeLog != "" {
+		sides := []string{"listen", "send"}
+		if *stressChromeLogSide != "" {
+			sides = []string{*stressChromeLogSide}
+		}
+		for _, side := range sides {
+			opts[side] = append(opts[side],
+				chromedp.Flag("enable-logging", true),
+				chromedp.Flag("v", "1"),
+				chromedp.Flag("log-file", filepath.Join(*stressChromeLog, side+"-chrome.log")))
+		}
+	}
 	p := &tabPair{t: t, listen: launchChrome(t, bin, opts["listen"]...)}
 	allocate(t, p.listen)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
@@ -1555,6 +1579,16 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	if *stressRelay > 0 {
 		dm = delayDERP(t, dm, *stressRelay/4, *stressJitter)
 		relays = &delayRelays{t: t, delay: *stressRelay / 2, jitter: *stressJitter}
+		if *stressRelayBurst != "" {
+			at, n, _ := strings.Cut(*stressRelayBurst, ":")
+			var err error
+			if relays.burstAt, err = time.ParseDuration(at); err == nil {
+				relays.burstN, err = strconv.Atoi(n)
+			}
+			if err != nil {
+				t.Fatalf("--web-stress-relay-burst=%q: %v", *stressRelayBurst, err)
+			}
+		}
 	}
 	srv := newWebServerWith(t, dm, func(mux *http.ServeMux) {
 		if relays != nil {
@@ -1598,6 +1632,9 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		}
 		if *stressShed != "" {
 			q.Set("shed", *stressShed)
+		}
+		if *stressStuck != "" {
+			q.Set("stuck", *stressStuck)
 		}
 	}
 	if *stressSeconds > 0 {
@@ -1667,7 +1704,12 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	start := time.Now()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
 
+	traced := false
 	defer func() {
+		if *stressTrace != "" && !traced {
+			// The transfer failed: its trace shows how.
+			writeRampTrace(t, p, *stressTrace)
+		}
 		for _, tab := range []struct {
 			name string
 			ctx  context.Context
@@ -1713,6 +1755,7 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
 	}
 	if *stressTrace != "" {
+		traced = true
 		writeRampTrace(t, p, *stressTrace)
 	}
 	if viaDERP && !switching {

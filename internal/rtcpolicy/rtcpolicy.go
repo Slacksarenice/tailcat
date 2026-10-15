@@ -524,6 +524,37 @@ func (s *Shedder) Tune(spec string) error {
 // second; 0 until it has.
 func (s *Shedder) Rate() float64 { return slices.Max(s.samples[:]) }
 
+// Drain tells when a path's send buffer has stopped draining. A WebRTC
+// path's can: after a burst loss at full speed, Chrome's SCTP has been
+// seen to send no data for most of a minute while its association, and
+// the pings over it, carried on as before, so that the path looked
+// healthy while it carried nothing. Its zero value is not usable; set
+// StuckAfter. It is not safe for concurrent use.
+type Drain struct {
+	// StuckAfter is how long the buffer may hold bytes without draining
+	// any before Stuck reports it. It should outlast a retransmission
+	// timeout or two of the path's own.
+	StuckAfter time.Duration
+
+	at       time.Time // when the buffer was last checked; zero before
+	buffered int       // bytes it held then
+	sent     int64     // bytes sent into it by then
+	since    time.Time // when it last drained, or was empty
+}
+
+// Stuck reports whether a buffer holding buffered bytes at now, after
+// sent bytes sent into it in all, has drained nothing for StuckAfter.
+// Sizes need only be in step with each other: framing that the buffer
+// counts and sent doesn't only makes a stuck buffer look more stuck.
+func (d *Drain) Stuck(buffered int, sent int64, now time.Time) bool {
+	drained := !d.at.IsZero() && int64(d.buffered)+(sent-d.sent)-int64(buffered) > 0
+	if d.at.IsZero() || buffered == 0 || drained {
+		d.since = now
+	}
+	d.at, d.buffered, d.sent = now, buffered, sent
+	return now.Sub(d.since) >= d.StuckAfter
+}
+
 // CheckDataOnly reports an error unless sdp describes a data channel
 // session and nothing else: exactly one media section, and that an
 // "application" one. The tunnel carries only datagrams, so a

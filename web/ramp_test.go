@@ -15,14 +15,15 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/tailscale/tailcat/web/stressbench/rampmetric"
 	"tailscale.com/tailcfg"
 )
 
@@ -132,6 +133,14 @@ func waitUntil(t time.Time) {
 type delayRelays struct {
 	t             *testing.T
 	delay, jitter time.Duration
+	// burstAt and burstN, if set, make the first relay to carry data
+	// drop the burstN data-sized datagrams (over 1000 bytes) it reads
+	// burstAt after its first, or those it reads in the following
+	// burstMax if fewer: one burst loss in the test, at a moment it
+	// chooses, which a sender that slows down doesn't prolong.
+	burstAt   time.Duration
+	burstN    int
+	burstDone atomic.Bool
 
 	mu     sync.Mutex
 	relays map[string]string // target address → the relay's
@@ -211,6 +220,9 @@ func (rs *delayRelays) start(host, target string) (string, error) {
 		defer close(line)
 		clock := delayClock{delay: rs.delay, jitter: rs.jitter}
 		var other *net.UDPAddr
+		var first, burstStart time.Time
+		burst := 0
+		const burstMax = 100 * time.Millisecond
 		buf := make([]byte, 64<<10)
 		for {
 			n, from, err := c.ReadFromUDP(buf)
@@ -218,6 +230,24 @@ func (rs *delayRelays) start(host, target string) (string, error) {
 				return
 			}
 			got++
+			if first.IsZero() {
+				first = time.Now()
+			}
+			if burst == 0 && n > 1000 && rs.burstN > 0 && time.Since(first) >= rs.burstAt && rs.burstDone.CompareAndSwap(false, true) {
+				burst, burstStart = rs.burstN, time.Now()
+				rs.t.Logf("relay %v: dropping a burst of %d data datagrams from %v", c.LocalAddr(), burst, time.Since(first).Round(time.Millisecond))
+			}
+			if burst > 0 && time.Since(burstStart) > burstMax {
+				rs.t.Logf("relay %v: burst ended after %v with %d left", c.LocalAddr(), burstMax, burst)
+				burst = -1
+			}
+			if burst > 0 && n > 1000 {
+				burst--
+				if burst == 0 {
+					rs.t.Logf("relay %v: burst dropped by %v", c.LocalAddr(), time.Since(first).Round(time.Millisecond))
+				}
+				continue
+			}
 			dst := to
 			if from.IP.Equal(to.IP) && from.Port == to.Port {
 				if dst = other; dst == nil {
@@ -294,16 +324,9 @@ func delayDERP(t *testing.T, dm *tailcfg.DERPMap, delay, jitter time.Duration) *
 	return cp
 }
 
-// rampPoint is a page's transfer progress at T (Unix ms).
-type rampPoint struct {
-	T    int64 `json:"t"`
-	Sent int64 `json:"sent"`
-	Recv int64 `json:"recv"`
-}
-
 // rampSide is what a page records of a transfer for its ramp trace.
 type rampSide struct {
-	Ramp       []rampPoint `json:"ramp"`
+	Ramp       []rampmetric.Point `json:"ramp"`
 	PathEvents []struct {
 		T    int64  `json:"t"`
 		Path string `json:"path"`
@@ -312,112 +335,6 @@ type rampSide struct {
 	// tailcat's samples (ramp-trace builds only).
 	TCP json.RawMessage `json:"tcp"`
 	RTC json.RawMessage `json:"rtc"`
-}
-
-// rampMetrics is how a transfer ramped up, in seconds from its start.
-type rampMetrics struct {
-	Steady float64 `json:"steadyMBps"` // the median 250 ms rate over the last third
-	T50    float64 `json:"t50"`        // when the rate first held 50% of Steady for a second
-	T90    float64 `json:"t90"`        // and 90%
-	Switch float64 `json:"switch"`     // when the sender's traffic moved to WebRTC; -1 if never
-	Total  float64 `json:"totalMBps"`  // bytes over the transfer's time
-	// Stalls counts the times nothing arrived for 2 s or more, after
-	// something had; the first began at StallAt (-1 if none). Steady,
-	// T50 and T90 are measured before it.
-	Stalls      int     `json:"stalls"`
-	StallAt     float64 `json:"stallAt"`
-	StalledSecs float64 `json:"stalledSecs"`
-}
-
-// computeRamp computes a transfer's ramp from the receiving page's
-// progress, from t0, when the sender started.
-func computeRamp(recv []rampPoint, t0 int64) rampMetrics {
-	m := rampMetrics{T50: -1, T90: -1, Switch: -1, StallAt: -1}
-	type bucket struct {
-		t    float64 // the bucket's start, seconds from t0
-		rate float64 // MB/s
-	}
-	var bs []bucket
-	end := -1
-	for i, p := range recv {
-		if i > 0 && p.Recv > recv[i-1].Recv {
-			end = i
-		}
-	}
-	for i := 1; i <= end; i++ {
-		a, b := recv[i-1], recv[i]
-		if a.T < t0 || b.T <= a.T {
-			continue
-		}
-		bs = append(bs, bucket{float64(a.T-t0) / 1e3, float64(b.Recv-a.Recv) / float64(b.T-a.T) / 1e3})
-	}
-	if len(bs) < 8 {
-		return m
-	}
-	m.Total = float64(recv[end].Recv) / (float64(recv[end].T-t0) / 1e3) / 1e6
-	// A stall: stallBuckets or more in a row with nothing received, once
-	// something was. The ramp is measured before the first one: a stalled
-	// path's last third says nothing of the rate it ramped to.
-	const stallBuckets = 8 // 2 s
-	moving, zeros, cut := false, 0, len(bs)
-	for i, b := range bs {
-		if b.rate > 0 {
-			moving = true
-			if zeros >= stallBuckets {
-				m.Stalls++
-				m.StalledSecs += float64(zeros) / 4
-			}
-			zeros = 0
-			continue
-		}
-		if !moving {
-			continue
-		}
-		if zeros++; zeros == stallBuckets {
-			if m.StallAt < 0 {
-				m.StallAt = bs[i-stallBuckets+1].t
-				cut = i - stallBuckets + 1
-			}
-		}
-	}
-	if zeros >= stallBuckets {
-		m.Stalls++
-		m.StalledSecs += float64(zeros) / 4
-	}
-	if cut < 8 {
-		return m
-	}
-	bs = bs[:cut]
-	last := bs[len(bs)-1].t
-	var tail []float64
-	for _, b := range bs[:len(bs)-4] { // not the last second, as the sender stops
-		if b.t >= last*2/3 {
-			tail = append(tail, b.rate)
-		}
-	}
-	if len(tail) == 0 {
-		return m
-	}
-	slices.Sort(tail)
-	m.Steady = tail[len(tail)/2]
-	for i := range bs {
-		// The mean rate over the second from this bucket on.
-		var sum float64
-		n := 0
-		for j := i; j < len(bs) && bs[j].t < bs[i].t+1; j++ {
-			sum += bs[j].rate
-			n++
-		}
-		mean := sum / float64(n)
-		if m.T50 < 0 && mean >= 0.5*m.Steady {
-			m.T50 = bs[i].t
-		}
-		if m.T90 < 0 && mean >= 0.9*m.Steady {
-			m.T90 = bs[i].t
-			break
-		}
-	}
-	return m
 }
 
 // writeRampTrace reads each page's ramp trace, logs the transfer's ramp,
@@ -443,7 +360,7 @@ func writeRampTrace(t *testing.T, p *tabPair, path string) {
 		return side
 	}
 	listen, send := read(p.listen), read(p.send)
-	m := computeRamp(listen.Ramp, send.SendStart)
+	m := rampmetric.Compute(listen.Ramp, send.SendStart)
 	for _, e := range send.PathEvents {
 		if e.Path == "webrtc" {
 			m.Switch = float64(e.T-send.SendStart) / 1e3
@@ -473,45 +390,5 @@ func writeRampTrace(t *testing.T, p *tabPair, path string) {
 	}
 	if math.IsNaN(m.Steady) {
 		t.Errorf("ramp: no steady rate")
-	}
-}
-
-func TestComputeRamp(t *testing.T) {
-	// 1 MB per 250 ms (4 MB/s) after a second at a quarter of that: the
-	// second from 0.5 s averages 2.5 MB/s, half the steady rate.
-	var recv []rampPoint
-	var n int64
-	for i := range 41 {
-		recv = append(recv, rampPoint{T: 1000 + int64(i)*250, Recv: n})
-		if i < 4 {
-			n += 250e3
-		} else {
-			n += 1e6
-		}
-	}
-	m := computeRamp(recv, 1000)
-	if m.Steady != 4 || m.T50 != 0.5 || m.T90 != 1 || m.Stalls != 0 || m.StallAt != -1 {
-		t.Errorf("computeRamp = %+v; want steady 4, t50 0.5, t90 1, no stalls", m)
-	}
-}
-
-func TestComputeRampStall(t *testing.T) {
-	// 4 MB/s for 6 s, nothing for 3 s, then 1 MB/s for 4 s: the ramp is
-	// the first 6 s's, and the stall is counted.
-	var recv []rampPoint
-	var n int64
-	for i := range 53 {
-		recv = append(recv, rampPoint{T: int64(i) * 250, Recv: n})
-		switch {
-		case i < 24:
-			n += 1e6
-		case i < 36:
-		default:
-			n += 250e3
-		}
-	}
-	m := computeRamp(recv, 0)
-	if m.Steady != 4 || m.T90 != 0 || m.Stalls != 1 || m.StallAt != 6 || m.StalledSecs != 3 {
-		t.Errorf("computeRamp = %+v; want steady 4, t90 0, one 3 s stall at 6 s", m)
 	}
 }
