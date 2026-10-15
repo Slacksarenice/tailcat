@@ -11,6 +11,7 @@ package rtcpolicy
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strconv"
@@ -93,7 +94,8 @@ type Liveness struct {
 	// still measured: each answer is timed against its own ping.
 	sent      [rttSlots]sentPing
 	srtt      time.Duration
-	lastHeard time.Time // when traffic last arrived over the path
+	lastHeard  time.Time // when traffic last arrived over the path
+	lastAnswer time.Time // when a ping was last answered
 
 	hold          time.Duration // the hold a relapse's recovery waits out
 	held          bool          // the current outage is a relapse: its recovery waits out the hold
@@ -231,6 +233,7 @@ func (l *Liveness) Heard(now time.Time) { l.lastHeard = now }
 // soon after its last recovery returns only once it has kept answering
 // for its hold (Tick finds it so, or an answer comes after the hold).
 func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
+	l.lastAnswer = now
 	if p := &l.sent[seq%rttSlots]; p.seq == seq && !p.at.IsZero() {
 		if rtt := now.Sub(p.at); rtt >= 0 {
 			if l.srtt == 0 {
@@ -305,6 +308,10 @@ func (l *Liveness) Restarted(now time.Time) {
 
 // Suspect reports whether traffic should stay off the path.
 func (l *Liveness) Suspect() bool { return l.suspect }
+
+// LastAnswer returns when a ping was last answered, any ping, however
+// late; zero if none has been.
+func (l *Liveness) LastAnswer() time.Time { return l.lastAnswer }
 
 // Backoff paces a client's attempts to negotiate a path. Its zero value
 // is not usable; set the durations.
@@ -382,8 +389,16 @@ type Shedder struct {
 	// within milliseconds: only a queue that stands is shed, as CoDel
 	// does, or every burst would cost TCP half its window.
 	Every time.Duration
+	// WarmSamples is how many intervals the rate must have been measured
+	// over before the line may fall below InitialLimit. A path's first
+	// measurements come while the tunnel's TCP and the path itself (a
+	// DataChannel's SCTP) are both still ramping up, and say little of
+	// what it can carry; shedding by them cuts TCP's window long before
+	// the path is full. 0 trusts the first.
+	WarmSamples int
 
 	aboveSince time.Time // when the buffer last went above the line; zero while below
+	measured   int       // intervals measured, up to WarmSamples
 	last       time.Time // of the last drop above the line
 
 	samples  [rateSamples]float64 // the latest drain rates measured, bytes per second
@@ -451,24 +466,103 @@ func (s *Shedder) measure(buffered int, now time.Time) {
 	if drained := s.sampled + s.added - buffered; s.sampled > 0 && buffered > 0 && drained > 0 {
 		s.samples[s.next] = float64(drained) / dt.Seconds()
 		s.next = (s.next + 1) % rateSamples
+		s.measured = min(s.measured+1, s.WarmSamples)
 	}
 	s.sampleAt, s.sampled, s.added = now, buffered, 0
 }
 
 // Limit returns the buffered bytes above which the Shedder sheds: what
 // the path drains in Target at its measured rate, within MinLimit and
-// HardLimit.
+// HardLimit, and no lower than InitialLimit until the rate has been
+// measured WarmSamples times.
 func (s *Shedder) Limit() int {
 	r := s.Rate()
 	if r == 0 {
 		return s.InitialLimit
 	}
-	return min(max(int(r*s.Target.Seconds()), s.MinLimit), s.HardLimit)
+	l := max(int(r*s.Target.Seconds()), s.MinLimit)
+	if s.measured < s.WarmSamples {
+		l = max(l, s.InitialLimit)
+	}
+	return min(l, s.HardLimit)
+}
+
+// Tune sets the Shedder's parameters from spec, comma-separated
+// key=value pairs: target and every (durations), min, init and hard
+// (bytes), and warm (WarmSamples). It is for experiments, such as the
+// browser stress test's A/B runs.
+func (s *Shedder) Tune(spec string) error {
+	for kv := range strings.SplitSeq(spec, ",") {
+		if kv == "" {
+			continue
+		}
+		k, v, _ := strings.Cut(kv, "=")
+		var err error
+		var n int
+		switch k {
+		case "target":
+			s.Target, err = time.ParseDuration(v)
+		case "every":
+			s.Every, err = time.ParseDuration(v)
+		case "min", "init", "hard", "warm":
+			n, err = strconv.Atoi(v)
+			switch k {
+			case "min":
+				s.MinLimit = n
+			case "init":
+				s.InitialLimit = n
+			case "hard":
+				s.HardLimit = n
+			case "warm":
+				s.WarmSamples = n
+			}
+		default:
+			err = errors.New("unknown parameter")
+		}
+		if err != nil {
+			return fmt.Errorf("shedder tuning %q: %v", kv, err)
+		}
+	}
+	return nil
 }
 
 // Rate returns the drain rate the Shedder has measured, in bytes per
 // second; 0 until it has.
 func (s *Shedder) Rate() float64 { return slices.Max(s.samples[:]) }
+
+// Drain tells when a path's send buffer has stopped draining. A WebRTC
+// path's can: after a burst loss at full speed, Chrome's SCTP has been
+// seen to send no data for most of a minute while its association, and
+// the pings over it, carried on as before, so that the path looked
+// healthy while it carried nothing. Its zero value is not usable; set
+// StuckAfter. It is not safe for concurrent use.
+type Drain struct {
+	// StuckAfter is how long the buffer may hold bytes without draining
+	// any before Stuck reports it. It should outlast a retransmission
+	// timeout or two of the path's own.
+	StuckAfter time.Duration
+
+	at       time.Time // when the buffer was last checked; zero before
+	buffered int       // bytes it held then
+	sent     int64     // bytes sent into it by then
+	since    time.Time // when it last drained, or was empty
+}
+
+// Stuck reports whether a buffer holding buffered bytes at now, after
+// sent bytes sent into it in all, has drained nothing for StuckAfter.
+// Sizes need only be in step with each other: framing that the buffer
+// counts and sent doesn't only makes a stuck buffer look more stuck.
+func (d *Drain) Stuck(buffered int, sent int64, now time.Time) bool {
+	drained := !d.at.IsZero() && int64(d.buffered)+(sent-d.sent)-int64(buffered) > 0
+	if d.at.IsZero() || buffered == 0 || drained {
+		d.since = now
+	}
+	d.at, d.buffered, d.sent = now, buffered, sent
+	return now.Sub(d.since) >= d.StuckAfter
+}
+
+// Reset starts the wait over: the next Stuck counts from its own time.
+func (d *Drain) Reset() { d.at = time.Time{} }
 
 // CheckDataOnly reports an error unless sdp describes a data channel
 // session and nothing else: exactly one media section, and that an

@@ -165,6 +165,13 @@ func renumberRegion(t *testing.T, dm *tailcfg.DERPMap, newID tailcfg.DERPRegionI
 // same-origin /derpmap.json describing the local test DERP server.
 func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
 	t.Helper()
+	return newWebServerWith(t, dm, nil)
+}
+
+// newWebServerWith is newWebServer, with more routes added by routes, if
+// not nil.
+func newWebServerWith(t *testing.T, dm *tailcfg.DERPMap, routes func(*http.ServeMux)) *httptest.Server {
+	t.Helper()
 	distDir, err := buildDist()
 	if err != nil {
 		t.Fatalf("building dist: %v", err)
@@ -179,6 +186,9 @@ func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(dm)
 	})
+	if routes != nil {
+		routes(mux)
+	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -1393,7 +1403,43 @@ var stressOnPage = flag.Bool("web-stress-on-page", false,
 	"TestBrowserWebRTCStress: run tailcat on each page (?worker=0) rather than in a Worker, to compare")
 
 var stressPath = flag.String("web-stress-path", "webrtc",
-	`TestBrowserWebRTCStress: the path to measure, "webrtc" or "derp" (WebRTC off on both pages, so every datagram goes through the local DERP server)`)
+	`TestBrowserWebRTCStress: the path to measure, "webrtc", "derp" (WebRTC off on both pages, so every datagram goes through the local DERP server), or "switch" (WebRTC on, but the transfer starts as soon as the sender dials, on DERP, and moves to the WebRTC path once it is up, as an app that doesn't wait for it does)`)
+
+var stressNetem = flag.Duration("web-stress-netem", 0,
+	"TestBrowserWebRTCStress: give both paths this round trip with Linux netem on the loopback interface (needs Linux and root): every UDP datagram (WebRTC) waits half of it, and every packet to or from the DERP server a quarter, so a datagram relayed by DERP waits half of it too. Unlike --web-stress-rtt, the DataChannel's SCTP sees it")
+
+var stressRelay = flag.Duration("web-stress-relay", 0,
+	"TestBrowserWebRTCStress: give both paths this round trip with the test's own delay relays (any OS; needs a ramp-trace build): each page's remote ICE candidates are rewritten to a UDP relay that forwards after half of it, and the pages reach DERP through a TCP proxy that holds each direction a quarter of it")
+
+var stressRelayBurst = flag.String("web-stress-relay-burst", "",
+	"TestBrowserWebRTCStress: with --web-stress-relay, AT:N has each relay drop the N data-sized datagrams it reads AT (a duration) after its first, to see how the path recovers from a burst loss")
+
+var stressJitter = flag.Duration("web-stress-jitter", 0,
+	"TestBrowserWebRTCStress: with --web-stress-netem or --web-stress-relay, vary each delay by up to this much, without reordering")
+
+var stressSeconds = flag.Int("web-stress-seconds", 0,
+	"TestBrowserWebRTCStress: end the transfer this many seconds after it starts, if --web-stress-bytes hasn't been sent by then")
+
+var stressTrace = flag.String("web-stress-trace", "",
+	"TestBrowserWebRTCStress: write the transfer's ramp trace (each page's bytes every 250 ms, its path changes, and tailcat's TCP and path samples) as JSON to this file, and log the ramp's metrics. Build with TAILCAT_WASM_TAGS=tailcat_ramptrace for tailcat's samples")
+
+var stressReliable = flag.Bool("web-stress-reliable", false,
+	"TestBrowserWebRTCStress: with a ramp-trace build, open the datagrams' DataChannel reliable and ordered rather than unordered with two retransmissions, to diagnose the channel")
+
+var stressChromeLog = flag.String("web-stress-chrome-log", "",
+	"TestBrowserWebRTCStress: have each side's Chrome log verbosely (--enable-logging --v=1) to listen-chrome.log and send-chrome.log in this directory")
+
+var stressChromeLogSide = flag.String("web-stress-chrome-log-side", "",
+	`TestBrowserWebRTCStress: with --web-stress-chrome-log, only this side's Chrome logs ("listen" or "send"): logging every SCTP packet slows a Chrome down`)
+
+var stressStuck = flag.String("web-stress-stuck", "",
+	`TestBrowserWebRTCStress: with a ramp-trace build, how long a DataChannel may hold datagrams without sending any before its session ends (a duration; "0" never ends it)`)
+
+var stressShed = flag.String("web-stress-shed", "",
+	"TestBrowserWebRTCStress: with a ramp-trace build, tune both paths' Shedders, as rtcpolicy.Shedder.Tune takes it (warm=20,init=1048576)")
+
+var stressCC = flag.String("web-stress-cc", "",
+	`TestBrowserWebRTCStress: with a ramp-trace build, the tunnel TCP's congestion control on both pages ("reno" or "cubic"); tailscale's (cubic) if empty`)
 
 var stressProfile = flag.String("web-stress-profile", "",
 	"TestBrowserWebRTCStress: write a CPU profile of each side's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory: of tailcat's Worker, or with --web-stress-on-page of the page. Build with TAILCAT_WASM_NAMES=1 for Go function names")
@@ -1507,10 +1553,51 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	default:
 		t.Fatalf("--web-stress-hide=%q; want send or listen", *stressHide)
 	}
+	if *stressRelay > 0 {
+		// One local address per page, so that each relay has one page on
+		// either side: the interface of the default route.
+		for _, side := range []string{"listen", "send"} {
+			opts[side] = append(opts[side], chromedp.Flag("force-webrtc-ip-handling-policy", "default_public_interface_only"))
+		}
+	}
+	if *stressChromeLog != "" {
+		sides := []string{"listen", "send"}
+		if *stressChromeLogSide != "" {
+			sides = []string{*stressChromeLogSide}
+		}
+		for _, side := range sides {
+			opts[side] = append(opts[side],
+				chromedp.Flag("enable-logging", true),
+				chromedp.Flag("v", "1"),
+				chromedp.Flag("log-file", filepath.Join(*stressChromeLog, side+"-chrome.log")))
+		}
+	}
 	p := &tabPair{t: t, listen: launchChrome(t, bin, opts["listen"]...)}
 	allocate(t, p.listen)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
-	srv := newWebServer(t, dm)
+	var relays *delayRelays
+	if *stressRelay > 0 {
+		dm = delayDERP(t, dm, *stressRelay/4, *stressJitter)
+		relays = &delayRelays{t: t, delay: *stressRelay / 2, jitter: *stressJitter}
+		if *stressRelayBurst != "" {
+			at, n, _ := strings.Cut(*stressRelayBurst, ":")
+			var err error
+			if relays.burstAt, err = time.ParseDuration(at); err == nil {
+				relays.burstN, err = strconv.Atoi(n)
+			}
+			if err != nil {
+				t.Fatalf("--web-stress-relay-burst=%q: %v", *stressRelayBurst, err)
+			}
+		}
+	}
+	srv := newWebServerWith(t, dm, func(mux *http.ServeMux) {
+		if relays != nil {
+			mux.Handle("/relay", relays)
+		}
+	})
+	if *stressNetem > 0 {
+		shapeLoopback(t, dm.Regions[1].Nodes[0].DERPPort, *stressNetem, *stressJitter)
+	}
 
 	delay := strconv.Itoa(int(stressDelay.Milliseconds() / 2)) // each side holds what it receives
 	listenQ := url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}}
@@ -1525,11 +1612,37 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		"timeline": {""},
 		"delay":    {delay},
 	}
-	if *stressOnPage {
-		listenQ.Set("worker", "0")
-		sendQ.Set("worker", "0")
+	for _, q := range []url.Values{listenQ, sendQ} {
+		if *stressOnPage {
+			q.Set("worker", "0")
+		}
+		if *stressTrace != "" {
+			q.Set("ramp", "")
+			q.Set("cc", *stressCC)
+		}
+		if *stressNetem > 0 || *stressRelay > 0 {
+			// The shaping matches IPv4 only.
+			q.Set("family", "4")
+		}
+		if *stressRelay > 0 {
+			q.Set("relay", "")
+		}
+		if *stressReliable {
+			q.Set("reliable", "")
+		}
+		if *stressShed != "" {
+			q.Set("shed", *stressShed)
+		}
+		if *stressStuck != "" {
+			q.Set("stuck", *stressStuck)
+		}
 	}
-	viaDERP := false
+	if *stressSeconds > 0 {
+		sendQ.Set("seconds", strconv.Itoa(*stressSeconds))
+	}
+	// viaDERP: the transfer starts once the sender has dialed, not once
+	// the WebRTC path is up.
+	viaDERP, switching := false, false
 	switch *stressPath {
 	case "webrtc":
 	case "derp":
@@ -1538,8 +1651,11 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			q.Del("webrtc")
 			q.Del("waitpath")
 		}
+	case "switch":
+		viaDERP, switching = true, true
+		sendQ.Del("waitpath")
 	default:
-		t.Fatalf("--web-stress-path=%q; want webrtc or derp", *stressPath)
+		t.Fatalf("--web-stress-path=%q; want webrtc, derp or switch", *stressPath)
 	}
 	var listenWorker, sendWorker <-chan target.ID
 	if !*stressOnPage {
@@ -1588,7 +1704,12 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	start := time.Now()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
 
+	traced := false
 	defer func() {
+		if *stressTrace != "" && !traced {
+			// The transfer failed: its trace shows how.
+			writeRampTrace(t, p, *stressTrace)
+		}
 		for _, tab := range []struct {
 			name string
 			ctx  context.Context
@@ -1598,7 +1719,8 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			chromedp.Run(ctx,
 				chromedp.Evaluate(`(window.tcTest.timeline || []).map(JSON.stringify).join("\n")`, &timeline),
 				chromedp.Evaluate(`JSON.stringify(window.tcTest.paths) + " maxLagMs=" + window.tcTest.maxLagMs`, &paths),
-				chromedp.Evaluate(`JSON.stringify(window.tailcatTestHooks)`, &hooks),
+				// The ramp trace's samples go to the trace file, not the log.
+				chromedp.Evaluate(`JSON.stringify(window.tailcatTestHooks, (k, v) => k.startsWith("ramp") && k !== "ramp" ? undefined : v)`, &hooks),
 			)
 			cancel()
 			t.Logf("%s paths %s\n%s hooks %s\n%s timeline:\n%s", tab.name, paths, tab.name, hooks, tab.name, timeline)
@@ -1606,6 +1728,9 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	}()
 
 	timeout := 120*time.Second + time.Duration(size/(256<<10))*time.Second
+	if *stressSeconds > 0 {
+		timeout = min(timeout, 120*time.Second+time.Duration(*stressSeconds)*time.Second)
+	}
 	var recvBytes, recvBad int
 	var done bool
 	p.step(p.listen, "receiving", timeout,
@@ -1620,13 +1745,30 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		stopProfile(t, sendProf, filepath.Join(*stressProfile, "send.cpuprofile"))
 	}
 	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
+	if *stressSeconds > 0 {
+		// The sender stopped when its time was up: it sent what it reports.
+		p.step(p.send, "reading what was sent", 30*time.Second,
+			poll("window.tcTest.sendDone === true"),
+			chromedp.Evaluate("window.tcTest.sentBytes", &size))
+	}
 	if recvBytes != size || recvBad != 0 {
 		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
 	}
-	if viaDERP {
+	if *stressTrace != "" {
+		traced = true
+		writeRampTrace(t, p, *stressTrace)
+	}
+	if viaDERP && !switching {
 		checkPageErrors(t, p.listen)
 		checkPageErrors(t, p.send)
 		return
+	}
+	stuckEnds := 0
+	for _, tab := range []context.Context{p.listen, p.send} {
+		var n int
+		p.step(tab, "reading the stuck channels", 10*time.Second,
+			chromedp.Evaluate(`(window.tailcatTestHooks || {}).stuck || 0`, &n))
+		stuckEnds += n
 	}
 	for _, tab := range []struct {
 		name string
@@ -1641,7 +1783,17 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		p.step(tab.ctx, tab.name+": reading the paths", 10*time.Second,
 			poll(`window.tcTest.pathsAtDone !== null`),
 			chromedp.Evaluate(`window.tcTest.pathsAtDone`, &paths))
-		if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }) {
+		switch {
+		case stuckEnds > 0:
+			// A session whose DataChannel stopped sending ended, by
+			// design: its traffic went over DERP until the next one.
+			t.Logf("%s tab's traffic moved %q: %d sessions ended for a DataChannel that stopped sending", tab.name, paths, stuckEnds)
+		case switching:
+			// It starts on DERP, which isn't reported, and moves once.
+			if !slices.Equal(paths, []string{"webrtc"}) {
+				t.Errorf("%s tab's traffic moved %q during the transfer; want it to move to webrtc once", tab.name, paths)
+			}
+		case len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "webrtc" }):
 			t.Errorf("%s tab's traffic moved %q during the transfer; want it on webrtc throughout", tab.name, paths)
 		}
 		// The network's round trip, as ICE last timed it, beside the

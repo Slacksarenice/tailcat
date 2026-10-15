@@ -45,7 +45,8 @@ func WasmExecJS() (string, error) {
 // WebRTC support needs. The binary records no paths from the build
 // machine. With $TAILCAT_WASM_NAMES=1 it keeps the binary's name
 // section, so CPU profiles name Go functions rather than
-// wasm-function[N].
+// wasm-function[N]; $TAILCAT_WASM_TAGS adds build tags, comma-separated
+// (tailcat_ramptrace for the stress test's ramp trace).
 func Build(pkgDir, outPath string) error {
 	modDir, err := os.MkdirTemp("", "tailcat-wasm-modfile")
 	if err != nil {
@@ -60,8 +61,12 @@ func Build(pkgDir, outPath string) error {
 	if os.Getenv("TAILCAT_WASM_NAMES") == "1" {
 		ldflags = "-ldflags=-w" // -s is what drops the name section
 	}
+	tags := buildtags.WasmTags() + "," + PacketPathTag
+	if extra := os.Getenv("TAILCAT_WASM_TAGS"); extra != "" {
+		tags += "," + extra
+	}
 	cmd := goCommand([]string{"GOOS=js", "GOARCH=wasm"}, "build",
-		"-tags", buildtags.WasmTags()+","+PacketPathTag,
+		"-tags", tags,
 		"-modfile", modfile,
 		"-trimpath",
 		ldflags, "-o", outPath, pkgDir)

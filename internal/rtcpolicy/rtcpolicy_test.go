@@ -623,6 +623,55 @@ func TestShedderMeasuresRate(t *testing.T) {
 	}
 }
 
+// TestShedderWarmUp: until the rate has been measured WarmSamples times,
+// a low first measurement doesn't take the line below InitialLimit;
+// afterwards the line follows the rate.
+func TestShedderWarmUp(t *testing.T) {
+	for _, warm := range []int{0, 20} {
+		s := &Shedder{
+			Target:       20 * time.Millisecond,
+			MinLimit:     16 << 10,
+			InitialLimit: 256 << 10,
+			HardLimit:    8 << 20,
+			Every:        100 * time.Millisecond,
+			WarmSamples:  warm,
+		}
+		// Half a second at 2 MB/s, backlogged: ten measurements.
+		simulatePath(t, s, 2e6, 9000, 2*time.Millisecond, 500*time.Millisecond)
+		low := max(int(2e6*0.02), 16<<10)
+		want := low
+		if warm > 0 {
+			want = 256 << 10
+		}
+		if got := s.Limit(); got != want {
+			t.Errorf("WarmSamples %d: after 10 measurements at 2 MB/s, line %d; want %d", warm, got, want)
+		}
+	}
+	// Two seconds: forty measurements, past the warm-up.
+	s := &Shedder{Target: 20 * time.Millisecond, MinLimit: 16 << 10, InitialLimit: 256 << 10, HardLimit: 8 << 20, Every: 100 * time.Millisecond, WarmSamples: 20}
+	simulatePath(t, s, 2e6, 9000, 2*time.Millisecond, 2*time.Second)
+	if got, want := s.Limit(), max(int(2e6*0.02), 16<<10); got < want*9/10 || got > want*11/10 {
+		t.Errorf("WarmSamples 20: after 2 s at 2 MB/s, line %d; want about %d", got, want)
+	}
+}
+
+func TestShedderTune(t *testing.T) {
+	s := newShedder()
+	if err := s.Tune("warm=20,init=1048576,target=40ms,every=50ms,min=1,hard=2"); err != nil {
+		t.Fatal(err)
+	}
+	want := Shedder{Target: 40 * time.Millisecond, MinLimit: 1, InitialLimit: 1 << 20, HardLimit: 2, Every: 50 * time.Millisecond, WarmSamples: 20}
+	if s.Target != want.Target || s.MinLimit != want.MinLimit || s.InitialLimit != want.InitialLimit ||
+		s.HardLimit != want.HardLimit || s.Every != want.Every || s.WarmSamples != want.WarmSamples {
+		t.Errorf("Tune: got %+v", *s)
+	}
+	for _, bad := range []string{"warm=x", "nope=1", "target=5"} {
+		if err := s.Tune(bad); err == nil {
+			t.Errorf("Tune(%q) = nil; want an error", bad)
+		}
+	}
+}
+
 // TestShedderIdleRate: a buffer that never backs up measures no rate, so
 // the line stays InitialLimit and nothing is dropped.
 func TestShedderIdleRate(t *testing.T) {
@@ -630,6 +679,52 @@ func TestShedderIdleRate(t *testing.T) {
 	_, dropped := simulatePath(t, s, 1e6, 10, 100*time.Millisecond, 2*time.Second)
 	if s.Rate() != 0 || dropped != 0 {
 		t.Errorf("rate %v, %d dropped; want no rate measured and none dropped", s.Rate(), dropped)
+	}
+}
+
+func TestDrain(t *testing.T) {
+	d := &Drain{StuckAfter: 3 * time.Second}
+	steps := []struct {
+		at       float64
+		buffered int
+		sent     int64
+		want     bool
+	}{
+		{0, 0, 0, false},           // empty
+		{0.5, 1000, 1000, false},   // filling: nothing drained yet, but just began
+		{1, 500, 1500, false},      // drains 1000
+		{2, 2000, 3000, false},     // drains nothing, as more arrives
+		{3.9, 2000, 3000, false},   // still nothing: 2.9 s since it last drained
+		{4.1, 2500, 3500, true},    // 3.1 s
+		{4.5, 2500, 3500, true},    // still stuck
+		{5, 2400, 3500, false},     // drains 100: unstuck
+		{8.1, 2400, 3500, true},    // stuck again for 3.1 s
+		{8.5, 0, 3500, false},      // empty: nothing to send isn't stuck
+		{12, 0, 3500, false},       //
+		{12.5, 9000, 12500, false}, // a burst
+		{15.6, 9000, 12500, true},  //
+	}
+	for _, st := range steps {
+		if got := d.Stuck(st.buffered, st.sent, at(st.at)); got != st.want {
+			t.Errorf("at %vs, %d buffered after %d sent: Stuck = %v, want %v", st.at, st.buffered, st.sent, got, st.want)
+		}
+	}
+	// After a Reset, the wait starts over, however long the buffer held.
+	d.Reset()
+	if d.Stuck(9000, 12500, at(16)) || d.Stuck(9000, 12500, at(18.9)) || !d.Stuck(9000, 12500, at(19.1)) {
+		t.Errorf("after Reset at 16s, Stuck should report only from 19s")
+	}
+}
+
+func TestLivenessLastAnswer(t *testing.T) {
+	var l Liveness
+	if !l.LastAnswer().IsZero() {
+		t.Errorf("LastAnswer before any answer = %v; want zero", l.LastAnswer())
+	}
+	// Any answer counts, even to a ping never sent.
+	l.Pong(7, at(2))
+	if got := l.LastAnswer(); !got.Equal(at(2)) {
+		t.Errorf("LastAnswer = %v; want %v", got, at(2))
 	}
 }
 
