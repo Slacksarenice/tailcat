@@ -35,6 +35,7 @@ import (
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/profiler"
+	"github.com/chromedp/cdproto/target"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/tailscale/tailcat"
@@ -1395,7 +1396,38 @@ var stressPath = flag.String("web-stress-path", "webrtc",
 	`TestBrowserWebRTCStress: the path to measure, "webrtc" or "derp" (WebRTC off on both pages, so every datagram goes through the local DERP server)`)
 
 var stressProfile = flag.String("web-stress-profile", "",
-	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory. It profiles the page's thread, which holds the tunnel's work only with --web-stress-on-page")
+	"TestBrowserWebRTCStress: write a CPU profile of each side's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory: of tailcat's Worker, or with --web-stress-on-page of the page. Build with TAILCAT_WASM_NAMES=1 for Go function names")
+
+// watchWorker returns a channel that receives the target ID of the
+// first dedicated Worker the page of ctx starts after the call: with
+// tailcat in a Worker, the thread that does the tunnel's work.
+func watchWorker(ctx context.Context) <-chan target.ID {
+	ch := make(chan target.ID, 1)
+	chromedp.ListenTarget(ctx, func(ev any) {
+		if ev, ok := ev.(*target.EventAttachedToTarget); ok && ev.TargetInfo.Type == "worker" {
+			select {
+			case ch <- ev.TargetInfo.TargetID:
+			default:
+			}
+		}
+	})
+	return ch
+}
+
+// workerContext returns a context for the Worker whose ID arrives on
+// ch, failing the test if none started.
+func workerContext(t *testing.T, tab context.Context, ch <-chan target.ID) context.Context {
+	t.Helper()
+	select {
+	case id := <-ch:
+		ctx, cancel := chromedp.NewContext(tab, chromedp.WithTargetID(id))
+		t.Cleanup(cancel)
+		return ctx
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the page started no Worker to profile")
+		return nil
+	}
+}
 
 // startProfile starts the CPU profiler of the page of ctx, sampling
 // every 100µs.
@@ -1509,10 +1541,17 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	default:
 		t.Fatalf("--web-stress-path=%q; want webrtc or derp", *stressPath)
 	}
+	var listenWorker, sendWorker <-chan target.ID
+	if !*stressOnPage {
+		listenWorker = watchWorker(p.listen)
+	}
 	addr := p.listenTab(srv, listenQ)
 	sendQ.Set("addr", addr)
 	p.send = launchChrome(t, bin, opts["send"]...)
 	allocate(t, p.send)
+	if !*stressOnPage {
+		sendWorker = watchWorker(p.send)
+	}
 	if viaDERP {
 		p.step(p.send, "sender ready", 90*time.Second,
 			chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
@@ -1537,9 +1576,14 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		// session before then.
 		p.eachTab("ICE's round trip", 15*time.Second, poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`))
 	}
+	listenProf, sendProf := p.listen, p.send
 	if *stressProfile != "" {
-		startProfile(t, p.listen)
-		startProfile(t, p.send)
+		if !*stressOnPage {
+			listenProf = workerContext(t, p.listen, listenWorker)
+			sendProf = workerContext(t, p.send, sendWorker)
+		}
+		startProfile(t, listenProf)
+		startProfile(t, sendProf)
 	}
 	start := time.Now()
 	p.step(p.send, "starting the send", 5*time.Second, chromedp.Evaluate("window.tcTest.go = true", nil))
@@ -1572,8 +1616,8 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	)
 	took := time.Since(start)
 	if *stressProfile != "" {
-		stopProfile(t, p.listen, filepath.Join(*stressProfile, "listen.cpuprofile"))
-		stopProfile(t, p.send, filepath.Join(*stressProfile, "send.cpuprofile"))
+		stopProfile(t, listenProf, filepath.Join(*stressProfile, "listen.cpuprofile"))
+		stopProfile(t, sendProf, filepath.Join(*stressProfile, "send.cpuprofile"))
 	}
 	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
 	if recvBytes != size || recvBad != 0 {
