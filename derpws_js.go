@@ -17,6 +17,7 @@ import (
 	"syscall/js"
 	"time"
 
+	"github.com/tailscale/tailcat/internal/jsfast"
 	"github.com/tailscale/tailcat/internal/rtcpolicy"
 	"tailscale.com/derp/derphttp"
 )
@@ -42,6 +43,10 @@ const (
 	derpFrameOverhead = 5 + 32
 	// derpShedLogEvery paces the log line of packets shed.
 	derpShedLogEvery = 10 * time.Second
+	// derpWSBuf is the size of each direction's reusable JS buffer, above
+	// a DERP frame's 64 KiB packet and header; a larger write or message
+	// takes a buffer of its own.
+	derpWSBuf = 128 << 10
 
 	// browserMaxWindow is 0: with every path's queue held short, the
 	// tunnel's TCP windows needn't be capped (see tuneTCP).
@@ -55,9 +60,14 @@ func init() {
 // derpWebSocket is a net.Conn over a browser WebSocket, for DERP. Its
 // writes never block; see ShedPacket.
 type derpWebSocket struct {
-	ws    js.Value
-	url   string
-	funcs []js.Func
+	ws      js.Value
+	url     string
+	funcs   []js.Func
+	fast    *jsfast.Helpers // nil if the page can't make them
+	recvBuf js.Value        // with fast, the Uint8Array each message is copied into
+
+	sendMu  sync.Mutex // guards sendBuf, which a write fills then sends
+	sendBuf js.Value   // with fast, a reusable Uint8Array for writes
 
 	mu       sync.Mutex
 	recv     [][]byte      // messages received and not yet read
@@ -114,18 +124,30 @@ func dialDERPWebSocket(ctx context.Context, urlStr string) (_ net.Conn, err erro
 		default:
 		}
 	})
-	c.on("onmessage", func(ev js.Value) {
-		d := ev.Get("data")
-		if !d.InstanceOf(js.Global().Get("ArrayBuffer")) {
-			return // DERP is binary; the server sends no text
-		}
-		b := make([]byte, d.Get("byteLength").Int())
-		js.CopyBytesToGo(b, js.Global().Get("Uint8Array").New(d))
-		c.mu.Lock()
-		c.recv = append(c.recv, b)
-		c.mu.Unlock()
-		c.signal()
-	})
+	if c.fast = jsfast.Get(); c.fast != nil {
+		u8 := js.Global().Get("Uint8Array")
+		c.recvBuf, c.sendBuf = u8.New(derpWSBuf), u8.New(derpWSBuf)
+		cb := js.FuncOf(func(this js.Value, args []js.Value) any {
+			if n := args[0].Int(); n >= 0 {
+				b := make([]byte, n)
+				js.CopyBytesToGo(b, c.recvBuf)
+				c.received(b)
+			} else {
+				c.receivedBuffer(args[1])
+			}
+			return nil
+		})
+		c.funcs = append(c.funcs, cb)
+		c.ws.Set("onmessage", c.fast.BinaryHandler(c.recvBuf, cb))
+	} else {
+		c.on("onmessage", func(ev js.Value) {
+			d := ev.Get("data")
+			if !d.InstanceOf(js.Global().Get("ArrayBuffer")) {
+				return // DERP is binary; the server sends no text
+			}
+			c.receivedBuffer(d)
+		})
+	}
 	c.on("onclose", func(ev js.Value) {
 		c.mu.Lock()
 		c.closed = true
@@ -156,6 +178,21 @@ func (c *derpWebSocket) on(prop string, f func(ev js.Value)) {
 	})
 	c.funcs = append(c.funcs, fn)
 	c.ws.Set(prop, fn)
+}
+
+// receivedBuffer queues a copy of the message in the ArrayBuffer d.
+func (c *derpWebSocket) receivedBuffer(d js.Value) {
+	b := make([]byte, d.Get("byteLength").Int())
+	js.CopyBytesToGo(b, js.Global().Get("Uint8Array").New(d))
+	c.received(b)
+}
+
+// received queues the message b for Read.
+func (c *derpWebSocket) received(b []byte) {
+	c.mu.Lock()
+	c.recv = append(c.recv, b)
+	c.mu.Unlock()
+	c.signal()
 }
 
 func (c *derpWebSocket) signal() {
@@ -209,6 +246,15 @@ func (c *derpWebSocket) Write(p []byte) (n int, err error) {
 	if closed {
 		return 0, net.ErrClosed
 	}
+	if c.fast != nil && len(p) <= derpWSBuf {
+		c.sendMu.Lock()
+		defer c.sendMu.Unlock()
+		js.CopyBytesToJS(c.sendBuf, p)
+		if err := c.fast.Send(c.ws, c.sendBuf, len(p)); err != nil {
+			return 0, fmt.Errorf("WebSocket %s: send: %v", c.url, err)
+		}
+		return len(p), nil
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			n, err = 0, fmt.Errorf("WebSocket %s: send: %v", c.url, r)
@@ -226,7 +272,12 @@ func (c *derpWebSocket) Write(p []byte) (n int, err error) {
 func (c *derpWebSocket) ShedPacket(size int) bool {
 	c.shedMu.Lock()
 	defer c.shedMu.Unlock()
-	buffered := c.ws.Get("bufferedAmount").Int()
+	var buffered int
+	if c.fast != nil {
+		buffered = c.fast.Buffered(c.ws)
+	} else {
+		buffered = c.ws.Get("bufferedAmount").Int()
+	}
 	now := time.Now()
 	if !c.shed.Drop(buffered, derpFrameOverhead+size, now) {
 		return false

@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/internal/jsfast"
 	"github.com/tailscale/tailcat/internal/rtcpolicy"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -405,6 +406,8 @@ type rtcSession struct {
 	sendScratch    []byte
 	sendBuf        js.Value // reusable Uint8Array for outgoing frames
 	recvScratch    []byte   // used only by onMessage, a JS callback
+	recvBuf        js.Value // Uint8Array a jsfast handler copies each message into
+	fast           *jsfast.Helpers // nil if the page can't make them
 	everQualified  bool
 	qualifiedAt    time.Time
 }
@@ -431,6 +434,8 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 		sendScratch: make([]byte, maxFrame),
 		sendBuf:     jsUint8Array.New(maxFrame),
 		recvScratch: make([]byte, maxFrame),
+		recvBuf:     jsUint8Array.New(maxFrame),
+		fast:        jsfast.Get(),
 		dc:          js.Undefined(),
 		ctl:         js.Undefined(),
 		live: rtcpolicy.Liveness{
@@ -588,24 +593,51 @@ func (s *rtcSession) createDataChannel(label string, opts map[string]any) (js.Va
 // panic in fn, which would otherwise end the program and every tunnel
 // in it, ends just this session.
 func (s *rtcSession) on(target js.Value, prop string, fn func(ev js.Value)) {
-	f := js.FuncOf(func(this js.Value, args []js.Value) any {
-		defer func() {
-			if r := recover(); r != nil {
-				s.logf("webrtc: %s handler: %v", prop, r)
-				s.close()
-			}
-		}()
+	target.Set(prop, s.funcOf(prop, func(args []js.Value) {
 		ev := js.Undefined()
 		if len(args) > 0 {
 			ev = args[0]
 		}
 		fn(ev)
+	}))
+}
+
+// funcOf returns fn as a JS function, remembered for release, that
+// ends just this session if fn panics.
+func (s *rtcSession) funcOf(name string, fn func(args []js.Value)) js.Func {
+	f := js.FuncOf(func(this js.Value, args []js.Value) any {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logf("webrtc: %s handler: %v", name, r)
+				s.close()
+			}
+		}()
+		fn(args)
 		return nil
 	})
 	s.mu.Lock()
 	s.funcs = append(s.funcs, f)
 	s.mu.Unlock()
-	target.Set(prop, f)
+	return f
+}
+
+// onFrames sets ch's message handler to pass each binary message to
+// onFrame, through a jsfast handler where the page can make one.
+func (s *rtcSession) onFrames(ch js.Value) {
+	if s.fast == nil {
+		s.on(ch, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+		return
+	}
+	cb := s.funcOf("onmessage", func(args []js.Value) {
+		n := args[0].Int()
+		if n < frameHeaderLen {
+			return // larger than any frame (-1), or too short to be one
+		}
+		b := s.recvScratch[:n]
+		js.CopyBytesToGo(b, s.recvBuf)
+		s.onFrame(b)
+	})
+	ch.Set("onmessage", s.fast.BinaryHandler(s.recvBuf, cb))
 }
 
 // sendSignal queues a signaling line without blocking, since it is
@@ -853,7 +885,7 @@ func (s *rtcSession) attachChannel(dc js.Value) {
 	s.mu.Unlock()
 	s.on(dc, "onopen", func(js.Value) { go s.qualify() })
 	s.on(dc, "onclose", func(js.Value) { go s.close() })
-	s.on(dc, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	s.onFrames(dc)
 	if dc.Get("readyState").String() == "open" {
 		go s.qualify()
 	}
@@ -868,7 +900,7 @@ func (s *rtcSession) attachControl(ctl js.Value) {
 	s.ctl = ctl
 	s.ctlSeen = true
 	s.mu.Unlock()
-	s.on(ctl, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	s.onFrames(ctl)
 	opened := func() {
 		if s.hooks.Truthy() {
 			s.hooks.Set("ctlOpen", true)
@@ -894,12 +926,26 @@ func isOpen(ch js.Value) bool {
 // sendFrameLocked sends frame on channel ch. It reports false if the
 // channel isn't open.
 func (s *rtcSession) sendFrameLocked(ch js.Value, frame []byte) bool {
+	if s.fast != nil {
+		// send throws unless ch is an open channel.
+		n := js.CopyBytesToJS(s.sendBuf, frame)
+		return s.fast.Send(ch, s.sendBuf, n) == nil
+	}
 	if !isOpen(ch) {
 		return false
 	}
 	n := js.CopyBytesToJS(s.sendBuf, frame)
 	_, err := jsCall(ch, "send", s.sendBuf.Call("subarray", 0, n))
 	return err == nil
+}
+
+// bufferedLocked returns how many bytes the datagrams' channel holds
+// queued.
+func (s *rtcSession) bufferedLocked() int {
+	if s.fast != nil {
+		return s.fast.Buffered(s.dc)
+	}
+	return s.dc.Get("bufferedAmount").Int()
 }
 
 // sendControl sends a probe, ping or answer. Probes and their answers
@@ -928,7 +974,7 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	if !s.qualified || s.live.Suspect() || frameHeaderLen+len(pkt) > maxFrame {
 		return false
 	}
-	if s.shed.Drop(s.dc.Get("bufferedAmount").Int(), frameHeaderLen+len(pkt), time.Now()) {
+	if s.shed.Drop(s.bufferedLocked(), frameHeaderLen+len(pkt), time.Now()) {
 		s.dropped++
 		return true // dropped: inner TCP slows down
 	}
@@ -959,11 +1005,18 @@ func (s *rtcSession) onMessage(data js.Value) {
 	if n < frameHeaderLen || n > maxFrame {
 		return
 	}
+	b := s.recvScratch[:n]
+	js.CopyBytesToGo(b, jsUint8Array.New(data))
+	s.onFrame(b)
+}
+
+// onFrame handles a DataChannel message's frame b, which it must not
+// keep. It runs in a JS callback, so it must not block.
+func (s *rtcSession) onFrame(b []byte) {
 	if s.hooks.Truthy() && s.hooks.Get("dropRTC").Truthy() {
 		return // a test is simulating a path that carries nothing
 	}
-	b := s.recvScratch[:n]
-	js.CopyBytesToGo(b, jsUint8Array.New(data))
+	n := len(b)
 	switch b[0] {
 	case frameWG:
 		s.mu.Lock()
