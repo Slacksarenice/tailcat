@@ -337,6 +337,90 @@ async function call(m) {
   throw new Error(`unknown call ${m.fn}`);
 }
 
+// --- Raw I/O ---
+
+// rawIO returns the tailcat module's own wasm imports (rawio_js.go),
+// which carry the DataChannel hot path without syscall/js, and the handle
+// table they work on: Go attaches each channel once, then names it by its
+// handle, and passes datagrams as a pointer and a length into its memory.
+// tailcat.js keeps a copy of this for a module run on the page.
+function rawIO() {
+  let mem = null; // the module's WebAssembly.Memory, once instantiated
+  const chans = new Map(); // handle → RTCDataChannel
+  let next = 1; // handles are never reused
+  const imports = {
+    // dcSend(h, p, n) sends the n bytes at p on channel h (none if n is
+    // 0) and returns its bufferedAmount, or -1 if it isn't open, -2 if
+    // send threw, -3 if there is no channel h. RTCDataChannel.send copies
+    // the bytes; the view is made afresh, as memory growth detaches the
+    // old buffer.
+    dcSend(h, p, n) {
+      const dc = chans.get(h);
+      if (!dc) {
+        return -3;
+      }
+      if (dc.readyState !== "open") {
+        return -1;
+      }
+      if (n > 0) {
+        try {
+          dc.send(new Uint8Array(mem.buffer, p >>> 0, n));
+        } catch {
+          return -2;
+        }
+      }
+      return dc.bufferedAmount;
+    },
+  };
+  return {
+    imports: { tailcat: imports },
+    // check throws unless this provides every tailcat import module needs,
+    // rather than leave instantiation to fail with a bare LinkError.
+    check(module) {
+      const missing = WebAssembly.Module.imports(module)
+        .filter((i) => i.module === "tailcat" && !Object.hasOwn(imports, i.name))
+        .map((i) => i.name);
+      if (missing.length > 0) {
+        throw new Error(`the module needs tailcat imports this script lacks (${missing.join(", ")}); ` +
+          "the module and its scripts must come from the same build");
+      }
+    },
+    bind(instance) {
+      mem = instance.exports.mem;
+    },
+    // The table, as the Go side sees it (tailcatRawIO).
+    table: {
+      attach(dc) {
+        const h = next++;
+        chans.set(h, dc);
+        return h;
+      },
+      detach(h) {
+        chans.delete(h);
+      },
+      // recv takes over channel h's onmessage: each binary message of 1 to
+      // cap bytes is copied to the cap bytes at ptr in the module's memory,
+      // and got called with its length. Anything else, and whatever a test
+      // hook would drop or delay, goes to slow with the event, as the Go
+      // side would handle it without raw I/O.
+      recv(h, ptr, cap, got, slow) {
+        const dc = chans.get(h);
+        dc.onmessage = (ev) => {
+          const d = ev.data;
+          const hooks = self.tailcatTestHooks;
+          if (!(d instanceof ArrayBuffer) || d.byteLength === 0 || d.byteLength > cap ||
+            (hooks && (hooks.dropRTC || hooks.delayMs > 0))) {
+            slow(ev);
+            return;
+          }
+          new Uint8Array(mem.buffer, ptr, d.byteLength).set(new Uint8Array(d));
+          got(d.byteLength);
+        };
+      },
+    },
+  };
+}
+
 // --- Starting ---
 
 async function start(m) {
@@ -350,7 +434,11 @@ async function start(m) {
   });
   let exited;
   try {
-    const instance = await WebAssembly.instantiate(m.module, go.importObject);
+    const raw = rawIO();
+    raw.check(m.module);
+    const instance = await WebAssembly.instantiate(m.module, { ...go.importObject, ...raw.imports });
+    raw.bind(instance);
+    self.tailcatRawIO = raw.table;
     // run settles only when the Go program exits, which it never does
     // unless it crashes.
     exited = go.run(instance).then(

@@ -60,6 +60,14 @@ func Build(pkgDir, outPath string) error {
 	if os.Getenv("TAILCAT_WASM_NAMES") == "1" {
 		ldflags = "-ldflags=-w" // -s is what drops the name section
 	}
+	// For A/B measurements: 0 sends and receives through syscall/js only;
+	// send uses raw I/O to send only (see web/rawio_js.go).
+	switch m := os.Getenv("TAILCAT_WASM_RAWIO"); m {
+	case "0":
+		ldflags += " -X main.rawIOMode=off"
+	case "send":
+		ldflags += " -X main.rawIOMode=" + m
+	}
 	cmd := goCommand([]string{"GOOS=js", "GOARCH=wasm"}, "build",
 		"-tags", buildtags.WasmTags()+","+PacketPathTag,
 		"-modfile", modfile,
