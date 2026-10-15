@@ -42,7 +42,9 @@ const (
 )
 
 // rawIOMode, set with -ldflags -X for A/B measurements, is "off" for no
-// raw I/O, "send" for sending only, or "" for both.
+// raw I/O, "send" for sending only, "func" for receiving through a JS
+// function (a js.Func called with the length) rather than the
+// tailcatRecv export, or "" for both through the export.
 var rawIOMode string
 
 // rawIO is the instantiator's handle table, read once at start: a page
@@ -73,8 +75,52 @@ func rawAttach(dc js.Value) int32 {
 // a detached one fails rather than reaching another channel.
 func rawDetach(h int32) {
 	if h != 0 {
+		delete(rawInboxes, h)
 		jsCall(rawIO, "detach", h)
 	}
+}
+
+// rawInbox is where tailcatRawIO puts a message received on a channel
+// for the drainer goroutine (rtcSession.drain), when the channel
+// receives through the tailcatRecv export: buf[:4] holds the length of
+// the message in buf[rawInboxHeader:], little-endian, or 0 while it is
+// empty. JS writes the message only while it is empty, so it never needs
+// to know more of Go's state than that word.
+type rawInbox struct {
+	buf  []byte
+	wake chan struct{} // capacity 1
+}
+
+// rawInboxHeader is the bytes before an inbox's message.
+const rawInboxHeader = 8
+
+// rawInboxes holds each handle's inbox, for tailcatRecv.
+var rawInboxes = map[int32]*rawInbox{}
+
+// tailcatRecv tells Go that JS put an n-byte message in the inbox of
+// handle h, and returns 1, or returns 0 if it can't take it (JS then
+// hands the message to the channel's slow onmessage). JS calls it from a
+// channel's onmessage, while Go is paused, and then resumes Go
+// (Go._resume) to run the drainer it wakes.
+//
+// It runs on the stack of whatever goroutine paused, outside the
+// scheduler: it must not block or allocate (an allocation can park the
+// goroutine to assist the garbage collector), which would leave its frame
+// behind and return to JS. A map lookup, plain writes and a non-blocking
+// send on a buffered channel of a pointer-free type do neither.
+//
+//go:wasmexport tailcatRecv
+func tailcatRecv(h, n int32) int32 {
+	in := rawInboxes[h]
+	if in == nil || n <= 0 || int(n) > len(in.buf)-rawInboxHeader {
+		return 0
+	}
+	in.buf[0], in.buf[1], in.buf[2], in.buf[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	select {
+	case in.wake <- struct{}{}:
+	default:
+	}
+	return 1
 }
 
 // rawSend sends frame on the channel of handle h; see dcSend.

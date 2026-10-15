@@ -344,8 +344,10 @@ async function call(m) {
 // table they work on: Go attaches each channel once, then names it by its
 // handle, and passes datagrams as a pointer and a length into its memory.
 // tailcat.js keeps a copy of this for a module run on the page.
-function rawIO() {
-  let mem = null; // the module's WebAssembly.Memory, once instantiated
+function rawIO(go) {
+  let exports = null; // the module's, once instantiated
+  let mem = null; // its WebAssembly.Memory
+  let words = new DataView(new ArrayBuffer(0)); // over mem.buffer, made afresh when memory grows
   const chans = new Map(); // handle → RTCDataChannel
   let next = 1; // handles are never reused
   const imports = {
@@ -386,7 +388,8 @@ function rawIO() {
       }
     },
     bind(instance) {
-      mem = instance.exports.mem;
+      exports = instance.exports;
+      mem = exports.mem;
     },
     // The table, as the Go side sees it (tailcatRawIO).
     table: {
@@ -417,6 +420,36 @@ function rawIO() {
           got(d.byteLength);
         };
       },
+      // recvInbox is recv through the module's tailcatRecv export: each
+      // message goes to the inbox at ptr (rawio_js.go's rawInbox) while
+      // its length word says it is empty, and tailcatRecv wakes the Go
+      // goroutine that reads it, which resuming Go then runs. A message
+      // that finds the inbox full goes to slow.
+      recvInbox(h, ptr, cap, slow) {
+        const dc = chans.get(h);
+        dc.onmessage = (ev) => {
+          const d = ev.data;
+          const hooks = self.tailcatTestHooks;
+          if (go.exited) {
+            return;
+          }
+          if (words.buffer !== mem.buffer) {
+            words = new DataView(mem.buffer);
+          }
+          const n = d instanceof ArrayBuffer ? d.byteLength : 0;
+          if (n === 0 || n > cap || (hooks && (hooks.dropRTC || hooks.delayMs > 0)) ||
+            words.getUint32(ptr, true) !== 0) {
+            slow(ev);
+            return;
+          }
+          new Uint8Array(mem.buffer, ptr + 8, n).set(new Uint8Array(d));
+          if (exports.tailcatRecv(h, n) === 0) {
+            slow(ev);
+            return;
+          }
+          go._resume();
+        };
+      },
     },
   };
 }
@@ -434,7 +467,7 @@ async function start(m) {
   });
   let exited;
   try {
-    const raw = rawIO();
+    const raw = rawIO(go);
     raw.check(m.module);
     const instance = await WebAssembly.instantiate(m.module, { ...go.importObject, ...raw.imports });
     raw.bind(instance);
