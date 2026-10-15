@@ -1,9 +1,10 @@
 # Interleaved A/B throughput and CPU benchmark over TestBrowserWebRTCStress
 # (PowerShell 7, Windows: CPU is summed over the chrome processes each run
 # starts). Each variant is a name => hashtable of environment variables set
-# for its runs, so alternating runs of two builds cancel the machine's drift.
+# for its runs, and under the key _args extra arguments for go test, so
+# alternating runs of two builds or settings cancel the machine's drift.
 #
-#   pwsh web/stressbench/ab.ps1 -Pairs 5 -Variants @{ a = @{}; b = @{ SOME_KNOB = "1" } }
+#   pwsh web/stressbench/ab.ps1 -Pairs 5 -Variants @{ fast = @{}; percall = @{ _args = @("--web-stress-csp") } }
 param(
     [string[]]$Paths = @("webrtc", "derp"),
     [int]$Pairs = 5,
@@ -18,14 +19,17 @@ $results = @()
 foreach ($path in $Paths) {
     foreach ($i in 1..$Pairs) {
         foreach ($name in ($Variants.Keys | Sort-Object)) {
-            $vars = $Variants[$name]
+            $vars = $Variants[$name].Clone()
+            $extra = @($vars["_args"] | Where-Object { $_ })
+            $vars.Remove("_args")
             foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }
             $before = @(Get-Process chrome -ErrorAction SilentlyContinue | ForEach-Object Id)
             $cpu = @{}
             $log = "$Out\$name-$path-$i.log"
-            $job = Start-Process -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError "$log.err" go -ArgumentList @(
+            $goArgs = @(
                 "test", "./web", "-run", "TestBrowserWebRTCStress$", "-count=1", "-v", "-timeout", "20m",
-                "--run-headless-browser-tests", "--web-stress-bytes=$Bytes", "--web-stress-path=$path") -WorkingDirectory $Repo
+                "--run-headless-browser-tests", "--web-stress-bytes=$Bytes", "--web-stress-path=$path") + $extra
+            $job = Start-Process -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError "$log.err" go -ArgumentList $goArgs -WorkingDirectory $Repo
             while (-not $job.HasExited) {
                 foreach ($p in Get-Process chrome -ErrorAction SilentlyContinue) {
                     if ($before -contains $p.Id) { continue }

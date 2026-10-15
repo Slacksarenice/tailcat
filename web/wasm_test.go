@@ -165,6 +165,18 @@ func renumberRegion(t *testing.T, dm *tailcfg.DERPMap, newID tailcfg.DERPRegionI
 // same-origin /derpmap.json describing the local test DERP server.
 func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
 	t.Helper()
+	return newWebServerCSP(t, dm, "")
+}
+
+// strictCSP lets the page compile wasm but not evaluate strings, as a
+// strict embedder's would, so tailcat can't make its internal/jsfast
+// helpers and takes its per-call path.
+const strictCSP = "script-src 'self' 'wasm-unsafe-eval'"
+
+// newWebServerCSP is newWebServer, with every response carrying the
+// Content-Security-Policy csp unless it is empty.
+func newWebServerCSP(t *testing.T, dm *tailcfg.DERPMap, csp string) *httptest.Server {
+	t.Helper()
 	distDir, err := buildDist()
 	if err != nil {
 		t.Fatalf("building dist: %v", err)
@@ -179,9 +191,35 @@ func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(dm)
 	})
-	srv := httptest.NewServer(mux)
+	var h http.Handler = mux
+	if csp != "" {
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Security-Policy", csp)
+			mux.ServeHTTP(w, r)
+		})
+	}
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// checkEvalBlocked fails the test unless the page of ctx is forbidden
+// to evaluate strings, so a test meant to run tailcat's per-call path
+// does.
+func checkEvalBlocked(t *testing.T, ctx context.Context) {
+	t.Helper()
+	var got string
+	// DevTools' evaluation is exempt from the CSP's eval rules unless
+	// told otherwise.
+	asPage := func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAllowUnsafeEvalBlockedByCSP(false)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => { try { new Function(""); return "allowed"; } catch (e) { return "blocked"; } })()`, &got, asPage)); err != nil {
+		t.Fatalf("checking the page's CSP: %v", err)
+	}
+	if got != "blocked" {
+		t.Fatalf("the page may evaluate strings (%s); want the CSP to forbid it", got)
+	}
 }
 
 // launchChrome boots a headless Chrome under chromedp and returns a
@@ -869,20 +907,27 @@ func (p *tabPair) checkTransferOf(size int) {
 // transfer can only complete over WebRTC. Each tab runs tailcat in a
 // Worker, as every test does unless it says otherwise.
 func TestBrowserToBrowserWebRTC(t *testing.T) {
-	testBrowserToBrowserWebRTC(t, nil)
+	testBrowserToBrowserWebRTC(t, nil, "")
 }
 
 // TestBrowserToBrowserWebRTCOnPage is TestBrowserToBrowserWebRTC with
 // tailcat on each page, as in a browser that can't hand a Worker a
 // DataChannel.
 func TestBrowserToBrowserWebRTCOnPage(t *testing.T) {
-	testBrowserToBrowserWebRTC(t, url.Values{"worker": {"0"}})
+	testBrowserToBrowserWebRTC(t, url.Values{"worker": {"0"}}, "")
 }
 
-func testBrowserToBrowserWebRTC(t *testing.T, extra url.Values) {
+// TestBrowserToBrowserWebRTCStrictCSP is TestBrowserToBrowserWebRTC on
+// pages whose CSP forbids evaluating strings, so DERP's WebSocket and
+// the DataChannels run without the internal/jsfast helpers.
+func TestBrowserToBrowserWebRTCStrictCSP(t *testing.T) {
+	testBrowserToBrowserWebRTC(t, nil, strictCSP)
+}
+
+func testBrowserToBrowserWebRTC(t *testing.T, extra url.Values, csp string) {
 	p := newTabPair(t)
 	dm, stopDERP := runStoppableDERP(t)
-	srv := newWebServer(t, dm)
+	srv := newWebServerCSP(t, dm, csp)
 
 	listenQ := url.Values{"webrtc": {"host"}}
 	sendQ := url.Values{
@@ -908,6 +953,10 @@ func testBrowserToBrowserWebRTC(t *testing.T, extra url.Values) {
 		poll(`window.tcTest.path === "webrtc"`),
 	)
 
+	if csp != "" {
+		checkEvalBlocked(t, p.listen)
+		checkEvalBlocked(t, p.send)
+	}
 	t.Logf("both tabs report a WebRTC path; stopping DERP")
 	stopDERP()
 	p.step(p.send, "starting the send", 10*time.Second,
@@ -1395,6 +1444,9 @@ var stressOnPage = flag.Bool("web-stress-on-page", false,
 var stressPath = flag.String("web-stress-path", "webrtc",
 	`TestBrowserWebRTCStress: the path to measure, "webrtc" or "derp" (WebRTC off on both pages, so every datagram goes through the local DERP server)`)
 
+var stressCSP = flag.Bool("web-stress-csp", false,
+	"TestBrowserWebRTCStress: serve the pages with a CSP that forbids evaluating strings, so tailcat runs without its internal/jsfast helpers, to compare")
+
 var stressProfile = flag.String("web-stress-profile", "",
 	"TestBrowserWebRTCStress: write a CPU profile of each side's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory: of tailcat's Worker, or with --web-stress-on-page of the page. Build with TAILCAT_WASM_NAMES=1 for Go function names")
 
@@ -1510,7 +1562,11 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	p := &tabPair{t: t, listen: launchChrome(t, bin, opts["listen"]...)}
 	allocate(t, p.listen)
 	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
-	srv := newWebServer(t, dm)
+	csp := ""
+	if *stressCSP {
+		csp = strictCSP
+	}
+	srv := newWebServerCSP(t, dm, csp)
 
 	delay := strconv.Itoa(int(stressDelay.Milliseconds() / 2)) // each side holds what it receives
 	listenQ := url.Values{"webrtc": {"host"}, "hooks": {""}, "sink": {"count"}, "timeline": {""}, "delay": {delay}}
