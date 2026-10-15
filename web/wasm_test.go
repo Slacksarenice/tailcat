@@ -1763,6 +1763,13 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		checkPageErrors(t, p.send)
 		return
 	}
+	stuckEnds := 0
+	for _, tab := range []context.Context{p.listen, p.send} {
+		var n int
+		p.step(tab, "reading the stuck channels", 10*time.Second,
+			chromedp.Evaluate(`(window.tailcatTestHooks || {}).stuck || 0`, &n))
+		stuckEnds += n
+	}
 	for _, tab := range []struct {
 		name string
 		ctx  context.Context
@@ -1777,6 +1784,10 @@ func TestBrowserWebRTCStress(t *testing.T) {
 			poll(`window.tcTest.pathsAtDone !== null`),
 			chromedp.Evaluate(`window.tcTest.pathsAtDone`, &paths))
 		switch {
+		case stuckEnds > 0:
+			// A session whose DataChannel stopped sending ended, by
+			// design: its traffic went over DERP until the next one.
+			t.Logf("%s tab's traffic moved %q: %d sessions ended for a DataChannel that stopped sending", tab.name, paths, stuckEnds)
 		case switching:
 			// It starts on DERP, which isn't reported, and moves once.
 			if !slices.Equal(paths, []string{"webrtc"}) {

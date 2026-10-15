@@ -94,7 +94,8 @@ type Liveness struct {
 	// still measured: each answer is timed against its own ping.
 	sent      [rttSlots]sentPing
 	srtt      time.Duration
-	lastHeard time.Time // when traffic last arrived over the path
+	lastHeard  time.Time // when traffic last arrived over the path
+	lastAnswer time.Time // when a ping was last answered
 
 	hold          time.Duration // the hold a relapse's recovery waits out
 	held          bool          // the current outage is a relapse: its recovery waits out the hold
@@ -232,6 +233,7 @@ func (l *Liveness) Heard(now time.Time) { l.lastHeard = now }
 // soon after its last recovery returns only once it has kept answering
 // for its hold (Tick finds it so, or an answer comes after the hold).
 func (l *Liveness) Pong(seq uint32, now time.Time) (recovered bool) {
+	l.lastAnswer = now
 	if p := &l.sent[seq%rttSlots]; p.seq == seq && !p.at.IsZero() {
 		if rtt := now.Sub(p.at); rtt >= 0 {
 			if l.srtt == 0 {
@@ -306,6 +308,10 @@ func (l *Liveness) Restarted(now time.Time) {
 
 // Suspect reports whether traffic should stay off the path.
 func (l *Liveness) Suspect() bool { return l.suspect }
+
+// LastAnswer returns when a ping was last answered, any ping, however
+// late; zero if none has been.
+func (l *Liveness) LastAnswer() time.Time { return l.lastAnswer }
 
 // Backoff paces a client's attempts to negotiate a path. Its zero value
 // is not usable; set the durations.
@@ -554,6 +560,9 @@ func (d *Drain) Stuck(buffered int, sent int64, now time.Time) bool {
 	d.at, d.buffered, d.sent = now, buffered, sent
 	return now.Sub(d.since) >= d.StuckAfter
 }
+
+// Reset starts the wait over: the next Stuck counts from its own time.
+func (d *Drain) Reset() { d.at = time.Time{} }
 
 // CheckDataOnly reports an error unless sdp describes a data channel
 // session and nothing else: exactly one media section, and that an

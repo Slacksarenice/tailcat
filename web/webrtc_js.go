@@ -142,11 +142,12 @@ const (
 	maxFrame     = frameHeaderLen + 65535
 
 	// A DataChannel that holds datagrams and sends none of them for
-	// stuckAfter (checked every drainCheckEvery) ends its session, though
-	// its pings may still be answered: after a burst loss at full speed,
+	// stuckAfter (checked every drainCheckEvery) while its pings are
+	// still answered ends its session: after a burst loss at full speed,
 	// Chrome's SCTP has sent no data for most of a minute while its
-	// association, and the pings, carried on (see rtcpolicy.Drain).
-	// stuckAfter outlasts an SCTP retransmission timeout or two.
+	// association, and the pings, carried on (see rtcpolicy.Drain). A
+	// path whose pings stop too is left to Liveness. stuckAfter outlasts
+	// an SCTP retransmission timeout or two, and a ping interval.
 	stuckAfter      = 3 * time.Second
 	drainCheckEvery = 500 * time.Millisecond
 
@@ -1314,14 +1315,25 @@ func (s *rtcSession) watch() {
 		case now := <-d.C:
 			s.mu.Lock()
 			stuck := false
-			if isOpen(s.dc) && s.drain.StuckAfter > 0 {
-				stuck = s.drain.Stuck(s.dc.Get("bufferedAmount").Int(), s.sentBytes, now)
+			switch {
+			case !isOpen(s.dc) || s.drain.StuckAfter <= 0:
+			case s.live.Suspect():
+				// The path itself is down: Liveness restarts ICE or
+				// ends the session. Once it recovers, the channel gets a
+				// full stuckAfter to drain what waited.
+				s.drain.Reset()
+			default:
+				// Stuck while the pings are still answered: the path
+				// works, and only the channel's SCTP has stopped. A path
+				// that went silent, pings and all, is Liveness's to
+				// handle.
+				stuck = s.drain.Stuck(s.dc.Get("bufferedAmount").Int(), s.sentBytes, now) &&
+					now.Sub(s.live.LastAnswer()) < s.drain.StuckAfter
 			}
 			s.mu.Unlock()
 			if stuck {
-				// The pings may still be answered; the session ends
-				// anyway, traffic goes over DERP, and the dialer
-				// negotiates a new one, whose SCTP starts afresh.
+				// The session ends, traffic goes over DERP, and the
+				// dialer negotiates a new one, whose SCTP starts afresh.
 				s.logf("webrtc: direct path to %v stopped sending what it is given; ending it", s.peer.ShortString())
 				s.countHook("stuck")
 				s.close()

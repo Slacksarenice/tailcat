@@ -709,6 +709,23 @@ func TestDrain(t *testing.T) {
 			t.Errorf("at %vs, %d buffered after %d sent: Stuck = %v, want %v", st.at, st.buffered, st.sent, got, st.want)
 		}
 	}
+	// After a Reset, the wait starts over, however long the buffer held.
+	d.Reset()
+	if d.Stuck(9000, 12500, at(16)) || d.Stuck(9000, 12500, at(18.9)) || !d.Stuck(9000, 12500, at(19.1)) {
+		t.Errorf("after Reset at 16s, Stuck should report only from 19s")
+	}
+}
+
+func TestLivenessLastAnswer(t *testing.T) {
+	var l Liveness
+	if !l.LastAnswer().IsZero() {
+		t.Errorf("LastAnswer before any answer = %v; want zero", l.LastAnswer())
+	}
+	// Any answer counts, even to a ping never sent.
+	l.Pong(7, at(2))
+	if got := l.LastAnswer(); !got.Equal(at(2)) {
+		t.Errorf("LastAnswer = %v; want %v", got, at(2))
+	}
 }
 
 func TestCheckDataOnly(t *testing.T) {
