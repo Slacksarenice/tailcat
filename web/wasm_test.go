@@ -1391,6 +1391,9 @@ var stressHide = flag.String("web-stress-hide", "",
 var stressOnPage = flag.Bool("web-stress-on-page", false,
 	"TestBrowserWebRTCStress: run tailcat on each page (?worker=0) rather than in a Worker, to compare")
 
+var stressPath = flag.String("web-stress-path", "webrtc",
+	`TestBrowserWebRTCStress: the path to measure, "webrtc" or "derp" (WebRTC off on both pages, so every datagram goes through the local DERP server)`)
+
 var stressProfile = flag.String("web-stress-profile", "",
 	"TestBrowserWebRTCStress: write a CPU profile of each page's transfer (listen.cpuprofile, send.cpuprofile, for Chrome's DevTools) to this directory. It profiles the page's thread, which holds the tunnel's work only with --web-stress-on-page")
 
@@ -1494,25 +1497,46 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		listenQ.Set("worker", "0")
 		sendQ.Set("worker", "0")
 	}
+	viaDERP := false
+	switch *stressPath {
+	case "webrtc":
+	case "derp":
+		viaDERP = true
+		for _, q := range []url.Values{listenQ, sendQ} {
+			q.Del("webrtc")
+			q.Del("waitpath")
+		}
+	default:
+		t.Fatalf("--web-stress-path=%q; want webrtc or derp", *stressPath)
+	}
 	addr := p.listenTab(srv, listenQ)
 	sendQ.Set("addr", addr)
 	p.send = launchChrome(t, bin, opts["send"]...)
 	allocate(t, p.send)
-	p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
-		chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
-		poll(`window.tcTest && window.tcTest.path === "webrtc"`),
-	)
-	p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second, poll(`window.tcTest.path === "webrtc"`))
+	if viaDERP {
+		p.step(p.send, "sender ready", 90*time.Second,
+			chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
+			poll(`window.tcTest && window.tcTest.dialed === true`),
+		)
+	} else {
+		p.step(p.send, "sender reaching a WebRTC path", 90*time.Second,
+			chromedp.Navigate(srv.URL+"/?"+withVerbose(sendQ).Encode()),
+			poll(`window.tcTest && window.tcTest.path === "webrtc"`),
+		)
+		p.step(p.listen, "listener reaching a WebRTC path", 30*time.Second, poll(`window.tcTest.path === "webrtc"`))
+	}
 	switch *stressHide {
 	case "send":
 		minimize(t, p.send)
 	case "listen":
 		minimize(t, p.listen)
 	}
-	// Each page's first stats report, ICE's round trip in it, comes a
-	// couple of seconds after its path; a short transfer can end the
-	// session before then.
-	p.eachTab("ICE's round trip", 15*time.Second, poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`))
+	if !viaDERP {
+		// Each page's first stats report, ICE's round trip in it, comes a
+		// couple of seconds after its path; a short transfer can end the
+		// session before then.
+		p.eachTab("ICE's round trip", 15*time.Second, poll(`typeof (window.tcTest.stats || {}).iceRttMs === "number"`))
+	}
 	if *stressProfile != "" {
 		startProfile(t, p.listen)
 		startProfile(t, p.send)
@@ -1554,6 +1578,11 @@ func TestBrowserWebRTCStress(t *testing.T) {
 	t.Logf("received %d bytes in %v (%.1f MB/s)", recvBytes, took.Round(time.Millisecond), float64(recvBytes)/took.Seconds()/1e6)
 	if recvBytes != size || recvBad != 0 {
 		t.Errorf("listener received %d bytes, %d of its samples wrong; want %d, none wrong", recvBytes, recvBad, size)
+	}
+	if viaDERP {
+		checkPageErrors(t, p.listen)
+		checkPageErrors(t, p.send)
+		return
 	}
 	for _, tab := range []struct {
 		name string

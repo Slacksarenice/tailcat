@@ -413,6 +413,7 @@ async function sendStream(addr, size, readChunk, progressEl) {
     addr, derpMapURL, verbose,
     webrtc: webrtcOption(), onPathChange, onPathStats,
   });
+  window.tcTest.dialed = true;
   // Test hooks: ?waitpath=webrtc holds the data until the direct path
   // is up, and ?gate until the test sets tcTest.go (after stopping the
   // DERP server, to prove the data doesn't need it).

@@ -43,7 +43,9 @@ func WasmExecJS() (string, error) {
 // binary to outPath. It builds with the magicsock packet path hook
 // (see [PacketPathModfile]) and [PacketPathTag], which the web app's
 // WebRTC support needs. The binary records no paths from the build
-// machine.
+// machine. With $TAILCAT_WASM_NAMES=1 it keeps the binary's name
+// section, so CPU profiles name Go functions rather than
+// wasm-function[N].
 func Build(pkgDir, outPath string) error {
 	modDir, err := os.MkdirTemp("", "tailcat-wasm-modfile")
 	if err != nil {
@@ -54,11 +56,15 @@ func Build(pkgDir, outPath string) error {
 	if err != nil {
 		return err
 	}
+	ldflags := "-ldflags=-s -w"
+	if os.Getenv("TAILCAT_WASM_NAMES") == "1" {
+		ldflags = "-ldflags=-w" // -s is what drops the name section
+	}
 	cmd := goCommand([]string{"GOOS=js", "GOARCH=wasm"}, "build",
 		"-tags", buildtags.WasmTags()+","+PacketPathTag,
 		"-modfile", modfile,
 		"-trimpath",
-		"-ldflags=-s -w", "-o", outPath, pkgDir)
+		ldflags, "-o", outPath, pkgDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("go build %v: %v\n%s", pkgDir, err, out)
 	}
