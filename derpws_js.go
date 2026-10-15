@@ -67,8 +67,9 @@ type derpWebSocket struct {
 
 	shedMu  sync.Mutex
 	shed    rtcpolicy.Shedder
-	shedN   int // packets shed since the last log line
-	shedLog time.Time
+	shedN     int   // packets shed since the last log line
+	shedTotal int64 // packets shed in all
+	shedLog   time.Time
 }
 
 var _ derphttp.PacketShedder = (*derpWebSocket)(nil)
@@ -145,6 +146,7 @@ func dialDERPWebSocket(ctx context.Context, urlStr string) (_ net.Conn, err erro
 		return nil, ctx.Err()
 	}
 	log.Printf("websocket: connected to %v", c.url)
+	traceDERP(c)
 	return c, nil
 }
 
@@ -232,6 +234,7 @@ func (c *derpWebSocket) ShedPacket(size int) bool {
 		return false
 	}
 	c.shedN++
+	c.shedTotal++
 	if now.Sub(c.shedLog) >= derpShedLogEvery {
 		log.Printf("derp: %s: shed %d packets to keep its queue short (%d bytes queued, line %d, relay at %.1f MB/s)",
 			c.url, c.shedN, buffered, c.shed.Limit(), c.shed.Rate()/1e6)

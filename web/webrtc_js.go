@@ -558,6 +558,7 @@ func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic
 		<-ctx.Done()
 		s.teardown()
 	}()
+	traceRTC(s)
 	return s, nil
 }
 
@@ -702,6 +703,9 @@ func (s *rtcSession) handleSignal(m signalMsg, answerer bool) error {
 		if s.hooks.Truthy() {
 			var c struct{ Candidate string }
 			if json.Unmarshal(m.Cand, &c) == nil && s.hookDropsFamily(rtcpolicy.CandidateFamily(c.Candidate)) {
+				return nil
+			}
+			if m.Cand = relayCandidate(s, m.Cand); m.Cand == nil {
 				return nil
 			}
 		}

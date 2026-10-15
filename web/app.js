@@ -22,6 +22,7 @@ window.tcTest = {
   sendDone: false,
   path: null, // "webrtc" or "derp" once reported
   paths: [],  // every path reported, in order
+  pathEvents: [], // {t: Unix ms, path} for each path reported
   pathsAtDone: null, // paths as they stood when this side's transfer completed
   stats: null, // the last onPathStats report
   go: false,  // with ?gate, the sender waits for the test to set this
@@ -39,6 +40,18 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 // datagram received that long, for a longer round trip.
 if (params.has("hooks")) {
   window.tailcatTestHooks = { dropRTC: false, family: params.get("family") || "", delayMs: Number(params.get("delay")) || 0 };
+  // ?ramp asks a ramp-trace build (TAILCAT_WASM_TAGS=tailcat_ramptrace)
+  // for its samples of the tunnel's TCP and paths, and ?cc picks its
+  // congestion control; other builds ignore both.
+  if (params.has("ramp")) {
+    window.tailcatTestHooks.ramp = true;
+    window.tailcatTestHooks.rampCC = params.get("cc") || "";
+  }
+  // ?relay has the test's delay relays stand between the pages (the
+  // stress test's --web-stress-relay; ramp-trace builds only).
+  if (params.has("relay")) {
+    window.tailcatTestHooks.relayURL = new URL("relay", location.href).href;
+  }
 }
 
 if (params.has("webrtc")) {
@@ -60,6 +73,7 @@ function webrtcOption() {
 function onPathChange({ peerKey, path }) {
   window.tcTest.path = path;
   window.tcTest.paths.push(path);
+  window.tcTest.pathEvents.push({ t: Date.now(), path });
   document.getElementById("path").textContent =
     path === "webrtc" ? "· direct (WebRTC)" : "· relayed (DERP)";
   if (verbose) {
@@ -396,6 +410,16 @@ if (params.has("timeline")) {
   }, 1000);
 }
 
+// With ?ramp, the page also records the transfer's bytes every 250 ms,
+// in Unix ms so that the two pages' series and tailcat's ramp trace
+// line up.
+if (params.has("ramp")) {
+  window.tcTest.ramp = [];
+  setInterval(() => {
+    window.tcTest.ramp.push({ t: Date.now(), sent: window.tcTest.sentBytes, recv: window.tcTest.recvBytes });
+  }, 250);
+}
+
 $("listen-btn").onclick = startListener;
 $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").textContent);
 
@@ -423,8 +447,12 @@ async function sendStream(addr, size, readChunk, progressEl) {
   if (params.has("gate")) {
     await until(() => window.tcTest.go);
   }
+  // ?seconds ends a test's transfer that long after it starts, however
+  // much of size it has sent.
+  const stopAt = params.has("seconds") ? Date.now() + 1000 * Number(params.get("seconds")) : Infinity;
+  window.tcTest.sendStart = Date.now();
   let off = 0;
-  while (off < size) {
+  while (off < size && Date.now() < stopAt) {
     const chunk = await readChunk(off, Math.min(CHUNK, size - off));
     await conn.write(chunk);
     off += chunk.length;

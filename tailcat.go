@@ -1883,6 +1883,7 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 		return nil, err
 	}
 	tuneTCP(logf, ns)
+	startRampTrace(ns)
 	return ns, nil
 }
 
