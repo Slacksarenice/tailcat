@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,21 +38,24 @@ var packetPathSource []byte
 //go:embed magicsockpatch/derpshed.go.in
 var derpShedSource []byte
 
-// patchFiles are the files the patch adds to tailscale.com, by path in
-// the module.
-var patchFiles = []struct {
-	path string
+// patchFile is a file a patch adds to its module.
+type patchFile struct {
+	path string // in the module
 	src  *[]byte
-}{
+}
+
+// packetPathFiles are the files the packet path patch adds to
+// tailscale.com.
+var packetPathFiles = []patchFile{
 	{"wgengine/magicsock/packetpath.go", &packetPathSource},
 	{"derp/derphttp/derpshed.go", &derpShedSource},
 }
 
-// magicsockEdit is one insertion into a tailscale.com file. The anchor
-// must occur exactly once; text is inserted immediately before or after
-// it.
-type magicsockEdit struct {
-	file   string // path in the tailscale.com module
+// moduleEdit is one insertion into a file of a module that browser
+// builds patch. The anchor must occur exactly once; text is inserted
+// immediately before or after it.
+type moduleEdit struct {
+	file   string // path in the module
 	anchor string
 	text   string
 	before bool // insert before the anchor instead of after it
@@ -61,7 +65,7 @@ type magicsockEdit struct {
 // into derphttp. They are kept to the minimum the hooks need so that a
 // tailscale.com upgrade rarely disturbs them; if one does,
 // PacketPathModfile fails, naming it.
-var packetPathEdits = []magicsockEdit{
+var packetPathEdits = []moduleEdit{
 	{
 		// The Conn's packet path state.
 		file:   "wgengine/magicsock/magicsock.go",
@@ -143,14 +147,14 @@ func downloadModule(mod string) (version, dir string, err error) {
 }
 
 // applyEdits returns src with every edit for file applied.
-func applyEdits(file string, src []byte, edits []magicsockEdit) ([]byte, error) {
+func applyEdits(file string, src []byte, edits []moduleEdit) ([]byte, error) {
 	s := string(src)
 	for _, e := range edits {
 		if e.file != file {
 			continue
 		}
 		if n := strings.Count(s, e.anchor); n != 1 {
-			return nil, fmt.Errorf("tailscale.com packet path patch: anchor %q occurs %d times in %s, want 1; did the tailscale.com dependency change? Update internal/wasmbuild/packetpath.go", e.anchor, n, file)
+			return nil, fmt.Errorf("wasm build patch: anchor %q occurs %d times in %s, want 1; did the dependency change? Update internal/wasmbuild", e.anchor, n, file)
 		}
 		i := strings.Index(s, e.anchor)
 		if !e.before {
@@ -161,14 +165,28 @@ func applyEdits(file string, src []byte, edits []magicsockEdit) ([]byte, error) 
 	return []byte(s), nil
 }
 
-// patchHash identifies the patch's content, so a changed patch gets a
-// fresh patched module copy.
-func patchHash() string {
+// modulePatch is a dependency that browser builds use patched.
+type modulePatch struct {
+	module string // its module path
+	why    string // what the patch does, for the go.mod comment
+	edits  []moduleEdit
+	files  []patchFile
+}
+
+// modulePatches are the dependencies that browser builds patch.
+var modulePatches = []modulePatch{
+	{"tailscale.com", "the magicsock packet path hook", packetPathEdits, packetPathFiles},
+	{"gvisor.dev/gvisor", "TCP's RTO recovery kept from fast recovery (see gvisorpatch.go)", gvisorEdits, nil},
+}
+
+// hash identifies the patch's content, so a changed patch gets a fresh
+// patched module copy.
+func (p modulePatch) hash() string {
 	h := sha256.New()
-	for _, e := range packetPathEdits {
+	for _, e := range p.edits {
 		fmt.Fprintf(h, "%q %q %q %v\n", e.file, e.anchor, e.text, e.before)
 	}
-	for _, f := range patchFiles {
+	for _, f := range p.files {
 		fmt.Fprintf(h, "%q\n", f.path)
 		h.Write(*f.src)
 	}
@@ -176,27 +194,26 @@ func patchHash() string {
 }
 
 // patchDir is where, under the tailcat module's root, the patched
-// tailscale.com copies live. The go command skips directories whose
-// names begin with a dot, so ./... never includes them; .gitignore
-// lists it.
+// module copies live. The go command skips directories whose names
+// begin with a dot, so ./... never includes them; .gitignore lists it.
 const patchDir = ".wasmbuild"
 
-// patchedTailscale returns the path, relative to the module root
-// modRoot, of a copy of the tailscale.com module that tailcat requires
-// with the magicsock packet path patch applied. The go command forbids
-// overlaying files in the module cache, so the patch is applied to a
-// copy instead. The copy is keyed by module version and patch content,
-// so builds reuse it (and their build cache stays warm). It lives
-// inside the module so the replace directive can name it relatively:
-// the binary's build information records that path, and an absolute
-// one would name the build machine's directories even under -trimpath.
-func patchedTailscale(modRoot string) (string, error) {
-	version, srcDir, err := downloadModule("tailscale.com")
+// patched returns the path, relative to the module root modRoot, of a
+// copy of the module that tailcat requires with p applied. The go
+// command forbids overlaying files in the module cache, so the patch is
+// applied to a copy instead. The copy is keyed by module version and
+// patch content, so builds reuse it (and their build cache stays warm).
+// It lives inside the module so the replace directive can name it
+// relatively: the binary's build information records that path, and an
+// absolute one would name the build machine's directories even under
+// -trimpath.
+func (p modulePatch) patched(modRoot string) (string, error) {
+	version, srcDir, err := downloadModule(p.module)
 	if err != nil {
 		return "", err
 	}
 	parent := filepath.Join(modRoot, patchDir)
-	name := "tailscale.com@" + version + "-pp" + patchHash()
+	name := strings.ReplaceAll(p.module, "/", "_") + "@" + version + "-pp" + p.hash()
 	rel := "./" + patchDir + "/" + name
 	dst := filepath.Join(parent, name)
 	if _, err := os.Stat(filepath.Join(dst, "go.mod")); err == nil {
@@ -216,26 +233,26 @@ func patchedTailscale(modRoot string) (string, error) {
 		return "", err
 	}
 	var edited []string
-	for _, e := range packetPathEdits {
+	for _, e := range p.edits {
 		if !slices.Contains(edited, e.file) {
 			edited = append(edited, e.file)
 		}
 	}
 	for _, name := range edited {
-		p := filepath.Join(tmp, filepath.FromSlash(name))
-		src, err := os.ReadFile(p)
+		path := filepath.Join(tmp, filepath.FromSlash(name))
+		src, err := os.ReadFile(path)
 		if err != nil {
 			return "", err
 		}
-		patched, err := applyEdits(name, src, packetPathEdits)
+		patched, err := applyEdits(name, src, p.edits)
 		if err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(p, patched, 0644); err != nil {
+		if err := os.WriteFile(path, patched, 0644); err != nil {
 			return "", err
 		}
 	}
-	for _, f := range patchFiles {
+	for _, f := range p.files {
 		if err := os.WriteFile(filepath.Join(tmp, filepath.FromSlash(f.path)), *f.src, 0644); err != nil {
 			return "", err
 		}
@@ -302,10 +319,16 @@ func copyWritable(src, dst string) error {
 }
 
 // PacketPathModfile writes, into dir, a go.mod (and go.sum) for the
-// tailcat module in the current directory that replaces tailscale.com
-// with a copy carrying the magicsock packet path hook, and returns its
-// path. Build with it via -modfile, together with -tags
+// tailcat module in the current directory that replaces the modules in
+// [modulePatches] with patched copies: tailscale.com with the magicsock
+// packet path hook, and gVisor with the browser's TCP fixes. It returns
+// its path. Build with it via -modfile, together with -tags
 // [PacketPathTag], and with GOWORK=off.
+//
+// $TAILCAT_WASM_REPLACE, module=>directory pairs separated by
+// semicolons, builds with other copies of dependencies instead, for
+// experiments such as the stress test's A/B runs; a module it names
+// isn't patched.
 func PacketPathModfile(dir string) (string, error) {
 	out, err := goCommand(nil, "env", "GOMOD").Output()
 	if err != nil {
@@ -315,11 +338,27 @@ func PacketPathModfile(dir string) (string, error) {
 	if gomod == "" || gomod == os.DevNull {
 		return "", fmt.Errorf("go env GOMOD: not in a module")
 	}
-	// Relative replace paths resolve against the main module's root,
-	// whichever file -modfile names.
-	tsDir, err := patchedTailscale(filepath.Dir(gomod))
-	if err != nil {
-		return "", err
+	replaced := map[string]string{}
+	for r := range strings.SplitSeq(os.Getenv("TAILCAT_WASM_REPLACE"), ";") {
+		if m, d, ok := strings.Cut(r, "=>"); ok {
+			replaced[strings.TrimSpace(m)] = strings.TrimSpace(d)
+		}
+	}
+	var replaces []byte
+	for _, p := range modulePatches {
+		if _, ok := replaced[p.module]; ok {
+			continue
+		}
+		// Relative replace paths resolve against the main module's root,
+		// whichever file -modfile names.
+		d, err := p.patched(filepath.Dir(gomod))
+		if err != nil {
+			return "", err
+		}
+		replaces = fmt.Appendf(replaces, "\n// Added by internal/wasmbuild: %s with %s.\nreplace %s => %s\n", p.module, p.why, p.module, strconv.Quote(d))
+	}
+	for _, m := range slices.Sorted(maps.Keys(replaced)) {
+		replaces = fmt.Appendf(replaces, "\n// Added by internal/wasmbuild from $TAILCAT_WASM_REPLACE.\nreplace %s => %s\n", m, strconv.Quote(replaced[m]))
 	}
 	mod, err := os.ReadFile(gomod)
 	if err != nil {
@@ -332,17 +371,7 @@ func PacketPathModfile(dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	mod = fmt.Appendf(mod, "\n// Added by internal/wasmbuild: tailscale.com with the magicsock packet path hook.\nreplace tailscale.com => %s\n", strconv.Quote(tsDir))
-	// $TAILCAT_WASM_REPLACE, module=>directory pairs separated by
-	// semicolons, builds with other copies of dependencies: for
-	// experiments, such as a patched gVisor in the stress test's A/B runs.
-	for r := range strings.SplitSeq(os.Getenv("TAILCAT_WASM_REPLACE"), ";") {
-		m, d, ok := strings.Cut(r, "=>")
-		if !ok {
-			continue
-		}
-		mod = fmt.Appendf(mod, "replace %s => %s\n", strings.TrimSpace(m), strconv.Quote(strings.TrimSpace(d)))
-	}
+	mod = append(mod, replaces...)
 	modfile := filepath.Join(dir, "tailcat-packetpath.mod")
 	if err := os.WriteFile(modfile, mod, 0644); err != nil {
 		return "", err

@@ -11,7 +11,7 @@ import (
 )
 
 func TestApplyEdits(t *testing.T) {
-	edits := []magicsockEdit{
+	edits := []moduleEdit{
 		{file: "a.go", anchor: "B\n", text: "after\n"},
 		{file: "a.go", anchor: "D\n", text: "before\n", before: true},
 		{file: "b.go", anchor: "X", text: "never"},
@@ -30,10 +30,11 @@ func TestApplyEdits(t *testing.T) {
 	}
 }
 
-// TestPacketPathModfile checks that the magicsock packet path edits
-// still apply to the tailscale.com version in go.mod, and that the
-// patched magicsock builds and passes the root package's packet path
-// tests (which need the patch and so don't run in plain go test).
+// TestPacketPathModfile checks that the patches still apply to the
+// tailscale.com and gVisor versions in go.mod, and that the patched
+// modules build and pass the tests that need them (the root package's
+// packet path tests, and gvisortest's), which don't run in plain go
+// test.
 func TestPacketPathModfile(t *testing.T) {
 	modfile, err := PacketPathModfile(t.TempDir())
 	if err != nil {
@@ -45,8 +46,10 @@ func TestPacketPathModfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `replace tailscale.com => "./` + patchDir + `/`; !strings.Contains(string(mod), want) {
-		t.Errorf("modfile has no relative replace %q:\n%s", want, mod)
+	for _, p := range modulePatches {
+		if want := `replace ` + p.module + ` => "./` + patchDir + `/`; !strings.Contains(string(mod), want) {
+			t.Errorf("modfile has no relative replace %q:\n%s", want, mod)
+		}
 	}
 	if testing.Short() {
 		t.Skip("skipping the patched build and packet path tests in -short mode")
@@ -61,7 +64,7 @@ func TestPacketPathModfile(t *testing.T) {
 	}{
 		// The browser build is what uses the patch; ./web is js-only.
 		{[]string{"GOOS=js", "GOARCH=wasm"}, []string{"vet", "-tags", PacketPathTag, "-modfile", modfile, ".", "./web"}},
-		{nil, []string{"test", "-count=1", "-tags", PacketPathTag, "-modfile", modfile, "-run", "PacketPath|NetworkChanged", "."}},
+		{nil, []string{"test", "-count=1", "-tags", PacketPathTag, "-modfile", modfile, "-run", "PacketPath|NetworkChanged|RTORecovery", ".", "./internal/wasmbuild/gvisortest"}},
 	} {
 		args := step.args
 		cmd := goCommand(step.env, args...)
