@@ -1005,6 +1005,53 @@ func TestBrowserListenRequiresOnConnection(t *testing.T) {
 	checkPageErrors(t, runCtx)
 }
 
+// TestBrowserRawIOMismatch starts a module that needs a tailcat import
+// (rawio_js.go) the scripts don't provide, as one from another build
+// would, on the page (tailcat.js) and in worker.js: each must refuse it
+// with an error naming the import, not a bare LinkError.
+func TestBrowserRawIOMismatch(t *testing.T) {
+	bin := preflight(t)
+	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
+	srv := newWebServer(t, dm)
+
+	browserCtx := launchChrome(t, bin)
+	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
+	t.Cleanup(cancelRun)
+
+	// (module (import "tailcat" "bogus" (func)))
+	const module = `new WebAssembly.Module(new Uint8Array([
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+		0x02, 0x11, 0x01, 0x07, 0x74, 0x61, 0x69, 0x6c, 0x63, 0x61, 0x74, 0x05, 0x62, 0x6f, 0x67, 0x75, 0x73, 0x00, 0x00]))`
+	awaitPromise := func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams { return p.WithAwaitPromise(true) }
+	var ready bool
+	var onPage, inWorker string
+	if err := chromedp.Run(runCtx,
+		chromedp.Navigate(srv.URL+"/"),
+		chromedp.Poll("window.tcTest && window.tcTest.ready === true", &ready,
+			chromedp.WithPollingTimeout(60*time.Second)),
+		chromedp.Evaluate(`tailcatStart({wasm: `+module+`, worker: false}).then(() => "started", (e) => String(e))`, &onPage, awaitPromise),
+		chromedp.Evaluate(`new Promise((resolve) => {
+			const w = new Worker("worker.js");
+			w.onmessage = (e) => {
+				if (e.data.t === "exit" || e.data.t === "ready") {
+					w.terminate();
+					resolve(e.data.t + ": " + e.data.error);
+				}
+			};
+			w.postMessage({t: "start", module: `+module+`, connType: null});
+		})`, &inWorker, awaitPromise),
+	); err != nil {
+		t.Fatalf("chromedp run: %v", err)
+	}
+	for _, got := range []struct{ where, msg string }{{"on the page", onPage}, {"in worker.js", inWorker}} {
+		if !strings.Contains(got.msg, "tailcat imports") || !strings.Contains(got.msg, "bogus") {
+			t.Errorf("starting a module with an unknown tailcat import %s gave %q; want an error naming the import", got.where, got.msg)
+		}
+	}
+	checkPageErrors(t, runCtx)
+}
+
 // TestBrowserDialBadAddrDoesNotBlock dials two addresses no client can
 // use and checks that the page keeps running. One doesn't parse, and is
 // refused at once. The other, a legacy address, parses, but its client
