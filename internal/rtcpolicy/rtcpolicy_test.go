@@ -623,6 +623,55 @@ func TestShedderMeasuresRate(t *testing.T) {
 	}
 }
 
+// TestShedderWarmUp: until the rate has been measured WarmSamples times,
+// a low first measurement doesn't take the line below InitialLimit;
+// afterwards the line follows the rate.
+func TestShedderWarmUp(t *testing.T) {
+	for _, warm := range []int{0, 20} {
+		s := &Shedder{
+			Target:       20 * time.Millisecond,
+			MinLimit:     16 << 10,
+			InitialLimit: 256 << 10,
+			HardLimit:    8 << 20,
+			Every:        100 * time.Millisecond,
+			WarmSamples:  warm,
+		}
+		// Half a second at 2 MB/s, backlogged: ten measurements.
+		simulatePath(t, s, 2e6, 9000, 2*time.Millisecond, 500*time.Millisecond)
+		low := max(int(2e6*0.02), 16<<10)
+		want := low
+		if warm > 0 {
+			want = 256 << 10
+		}
+		if got := s.Limit(); got != want {
+			t.Errorf("WarmSamples %d: after 10 measurements at 2 MB/s, line %d; want %d", warm, got, want)
+		}
+	}
+	// Two seconds: forty measurements, past the warm-up.
+	s := &Shedder{Target: 20 * time.Millisecond, MinLimit: 16 << 10, InitialLimit: 256 << 10, HardLimit: 8 << 20, Every: 100 * time.Millisecond, WarmSamples: 20}
+	simulatePath(t, s, 2e6, 9000, 2*time.Millisecond, 2*time.Second)
+	if got, want := s.Limit(), max(int(2e6*0.02), 16<<10); got < want*9/10 || got > want*11/10 {
+		t.Errorf("WarmSamples 20: after 2 s at 2 MB/s, line %d; want about %d", got, want)
+	}
+}
+
+func TestShedderTune(t *testing.T) {
+	s := newShedder()
+	if err := s.Tune("warm=20,init=1048576,target=40ms,every=50ms,min=1,hard=2"); err != nil {
+		t.Fatal(err)
+	}
+	want := Shedder{Target: 40 * time.Millisecond, MinLimit: 1, InitialLimit: 1 << 20, HardLimit: 2, Every: 50 * time.Millisecond, WarmSamples: 20}
+	if s.Target != want.Target || s.MinLimit != want.MinLimit || s.InitialLimit != want.InitialLimit ||
+		s.HardLimit != want.HardLimit || s.Every != want.Every || s.WarmSamples != want.WarmSamples {
+		t.Errorf("Tune: got %+v", *s)
+	}
+	for _, bad := range []string{"warm=x", "nope=1", "target=5"} {
+		if err := s.Tune(bad); err == nil {
+			t.Errorf("Tune(%q) = nil; want an error", bad)
+		}
+	}
+}
+
 // TestShedderIdleRate: a buffer that never backs up measures no rate, so
 // the line stays InitialLimit and nothing is dropped.
 func TestShedderIdleRate(t *testing.T) {

@@ -333,6 +333,16 @@ func PacketPathModfile(dir string) (string, error) {
 		return "", err
 	}
 	mod = fmt.Appendf(mod, "\n// Added by internal/wasmbuild: tailscale.com with the magicsock packet path hook.\nreplace tailscale.com => %s\n", strconv.Quote(tsDir))
+	// $TAILCAT_WASM_REPLACE, module=>directory pairs separated by
+	// semicolons, builds with other copies of dependencies: for
+	// experiments, such as a patched gVisor in the stress test's A/B runs.
+	for r := range strings.SplitSeq(os.Getenv("TAILCAT_WASM_REPLACE"), ";") {
+		m, d, ok := strings.Cut(r, "=>")
+		if !ok {
+			continue
+		}
+		mod = fmt.Appendf(mod, "replace %s => %s\n", strings.TrimSpace(m), strconv.Quote(strings.TrimSpace(d)))
+	}
 	modfile := filepath.Join(dir, "tailcat-packetpath.mod")
 	if err := os.WriteFile(modfile, mod, 0644); err != nil {
 		return "", err

@@ -764,14 +764,16 @@ func (s *rtcSession) addCandidate(c json.RawMessage) {
 // offer creates the DataChannels and sends an offer; the dialer calls
 // it.
 func (s *rtcSession) offer() error {
-	dc, err := s.createDataChannel(dataChannelName, map[string]any{
+	opts := map[string]any{
 		"ordered": false,
 		// SCTP splits datagrams larger than its path MTU into
 		// fragments; a couple of retransmissions repair a lost
 		// fragment without the head-of-line blocking of a reliable
 		// channel. Inner TCP handles anything still lost.
 		"maxRetransmits": 2,
-	})
+	}
+	rampChannelOptions(s, opts)
+	dc, err := s.createDataChannel(dataChannelName, opts)
 	if err != nil {
 		return err
 	}

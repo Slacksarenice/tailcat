@@ -1420,6 +1420,12 @@ var stressSeconds = flag.Int("web-stress-seconds", 0,
 var stressTrace = flag.String("web-stress-trace", "",
 	"TestBrowserWebRTCStress: write the transfer's ramp trace (each page's bytes every 250 ms, its path changes, and tailcat's TCP and path samples) as JSON to this file, and log the ramp's metrics. Build with TAILCAT_WASM_TAGS=tailcat_ramptrace for tailcat's samples")
 
+var stressReliable = flag.Bool("web-stress-reliable", false,
+	"TestBrowserWebRTCStress: with a ramp-trace build, open the datagrams' DataChannel reliable and ordered rather than unordered with two retransmissions, to diagnose the channel")
+
+var stressShed = flag.String("web-stress-shed", "",
+	"TestBrowserWebRTCStress: with a ramp-trace build, tune both paths' Shedders, as rtcpolicy.Shedder.Tune takes it (warm=20,init=1048576)")
+
 var stressCC = flag.String("web-stress-cc", "",
 	`TestBrowserWebRTCStress: with a ramp-trace build, the tunnel TCP's congestion control on both pages ("reno" or "cubic"); tailscale's (cubic) if empty`)
 
@@ -1586,6 +1592,12 @@ func TestBrowserWebRTCStress(t *testing.T) {
 		}
 		if *stressRelay > 0 {
 			q.Set("relay", "")
+		}
+		if *stressReliable {
+			q.Set("reliable", "")
+		}
+		if *stressShed != "" {
+			q.Set("shed", *stressShed)
 		}
 	}
 	if *stressSeconds > 0 {

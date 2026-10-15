@@ -11,6 +11,10 @@ import "encoding/json"
 // ramptrace_js.go).
 func traceRTC(*rtcSession) {}
 
+// rampChannelOptions leaves the options as they are outside the stress
+// test's ramp-trace build (see ramptrace_js.go).
+func rampChannelOptions(*rtcSession, map[string]any) {}
+
 // relayCandidate returns the remote candidate unchanged outside the
 // stress test's ramp-trace build (see ramptrace_js.go).
 func relayCandidate(_ *rtcSession, cand json.RawMessage) json.RawMessage { return cand }

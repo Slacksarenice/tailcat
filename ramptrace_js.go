@@ -7,6 +7,7 @@ package tailcat
 
 import (
 	"encoding/json"
+	"log"
 	"sync"
 	"syscall/js"
 	"time"
@@ -78,6 +79,19 @@ var rampDERPs struct {
 
 // traceDERP adds c to the DERP WebSockets the ramp trace samples.
 func traceDERP(c *derpWebSocket) {
+	hooks := js.Global().Get("tailcatTestHooks")
+	if !hooks.Truthy() || !hooks.Get("ramp").Truthy() {
+		return
+	}
+	// rampShed tunes the Shedder, for A/B runs (rtcpolicy.Shedder.Tune).
+	if spec := hooks.Get("rampShed"); spec.Type() == js.TypeString {
+		c.shedMu.Lock()
+		err := c.shed.Tune(spec.String())
+		c.shedMu.Unlock()
+		if err != nil {
+			log.Printf("derp: %v", err)
+		}
+	}
 	rampDERPs.mu.Lock()
 	rampDERPs.conns = append(rampDERPs.conns, c)
 	rampDERPs.mu.Unlock()

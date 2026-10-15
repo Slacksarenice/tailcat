@@ -11,6 +11,7 @@ package rtcpolicy
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strconv"
@@ -382,8 +383,16 @@ type Shedder struct {
 	// within milliseconds: only a queue that stands is shed, as CoDel
 	// does, or every burst would cost TCP half its window.
 	Every time.Duration
+	// WarmSamples is how many intervals the rate must have been measured
+	// over before the line may fall below InitialLimit. A path's first
+	// measurements come while the tunnel's TCP and the path itself (a
+	// DataChannel's SCTP) are both still ramping up, and say little of
+	// what it can carry; shedding by them cuts TCP's window long before
+	// the path is full. 0 trusts the first.
+	WarmSamples int
 
 	aboveSince time.Time // when the buffer last went above the line; zero while below
+	measured   int       // intervals measured, up to WarmSamples
 	last       time.Time // of the last drop above the line
 
 	samples  [rateSamples]float64 // the latest drain rates measured, bytes per second
@@ -451,19 +460,64 @@ func (s *Shedder) measure(buffered int, now time.Time) {
 	if drained := s.sampled + s.added - buffered; s.sampled > 0 && buffered > 0 && drained > 0 {
 		s.samples[s.next] = float64(drained) / dt.Seconds()
 		s.next = (s.next + 1) % rateSamples
+		s.measured = min(s.measured+1, s.WarmSamples)
 	}
 	s.sampleAt, s.sampled, s.added = now, buffered, 0
 }
 
 // Limit returns the buffered bytes above which the Shedder sheds: what
 // the path drains in Target at its measured rate, within MinLimit and
-// HardLimit.
+// HardLimit, and no lower than InitialLimit until the rate has been
+// measured WarmSamples times.
 func (s *Shedder) Limit() int {
 	r := s.Rate()
 	if r == 0 {
 		return s.InitialLimit
 	}
-	return min(max(int(r*s.Target.Seconds()), s.MinLimit), s.HardLimit)
+	l := max(int(r*s.Target.Seconds()), s.MinLimit)
+	if s.measured < s.WarmSamples {
+		l = max(l, s.InitialLimit)
+	}
+	return min(l, s.HardLimit)
+}
+
+// Tune sets the Shedder's parameters from spec, comma-separated
+// key=value pairs: target and every (durations), min, init and hard
+// (bytes), and warm (WarmSamples). It is for experiments, such as the
+// browser stress test's A/B runs.
+func (s *Shedder) Tune(spec string) error {
+	for kv := range strings.SplitSeq(spec, ",") {
+		if kv == "" {
+			continue
+		}
+		k, v, _ := strings.Cut(kv, "=")
+		var err error
+		var n int
+		switch k {
+		case "target":
+			s.Target, err = time.ParseDuration(v)
+		case "every":
+			s.Every, err = time.ParseDuration(v)
+		case "min", "init", "hard", "warm":
+			n, err = strconv.Atoi(v)
+			switch k {
+			case "min":
+				s.MinLimit = n
+			case "init":
+				s.InitialLimit = n
+			case "hard":
+				s.HardLimit = n
+			case "warm":
+				s.WarmSamples = n
+			}
+		default:
+			err = errors.New("unknown parameter")
+		}
+		if err != nil {
+			return fmt.Errorf("shedder tuning %q: %v", kv, err)
+		}
+	}
+	return nil
 }
 
 // Rate returns the drain rate the Shedder has measured, in bytes per

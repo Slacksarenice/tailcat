@@ -28,6 +28,10 @@ type metrics struct {
 	T90    float64 `json:"t90"`
 	Switch float64 `json:"switch"`
 	Total  float64 `json:"totalMBps"`
+	// Stalls of 2 s or more; the ramp is measured before the first.
+	Stalls      int
+	StallAt     float64
+	StalledSecs float64
 }
 
 type tcpConn struct {
@@ -131,7 +135,7 @@ func summarize(dir string) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Println("variant  path     rtt  n  steady MB/s        t50 s              t90 s              overall MB/s       WebRTC at s")
+	fmt.Println("variant  path     rtt  n stalled  steady MB/s        t50 s              t90 s              overall MB/s       WebRTC at s")
 	for _, k := range keys {
 		ms := groups[k]
 		col := func(f func(metrics) float64) string {
@@ -142,7 +146,13 @@ func summarize(dir string) {
 			slices.Sort(v)
 			return fmt.Sprintf("%5.1f (%5.1f–%5.1f)", v[len(v)/2], v[0], v[len(v)-1])
 		}
-		fmt.Printf("%s %2d %s %s %s %s %s\n", k, len(ms),
+		stalled := 0
+		for _, m := range ms {
+			if m.Stalls > 0 {
+				stalled++
+			}
+		}
+		fmt.Printf("%s %2d %7d %s %s %s %s %s\n", k, len(ms), stalled,
 			col(func(m metrics) float64 { return m.Steady }),
 			col(func(m metrics) float64 { return m.T50 }),
 			col(func(m metrics) float64 { return m.T90 }),

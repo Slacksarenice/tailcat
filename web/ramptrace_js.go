@@ -51,6 +51,15 @@ func traceRTC(s *rtcSession) {
 	if !s.hooks.Truthy() || !s.hooks.Get("ramp").Truthy() {
 		return
 	}
+	// rampShed tunes the Shedder, for A/B runs (rtcpolicy.Shedder.Tune).
+	if spec := s.hooks.Get("rampShed"); spec.Type() == js.TypeString {
+		s.mu.Lock()
+		err := s.shed.Tune(spec.String())
+		s.mu.Unlock()
+		if err != nil {
+			s.logf("webrtc: %v", err)
+		}
+	}
 	go func() {
 		var samples []rampRTCSample
 		tick := time.NewTicker(rampEvery)
@@ -117,8 +126,19 @@ func relayCandidate(s *rtcSession, cand json.RawMessage) json.RawMessage {
 	return out
 }
 
-// rampWireStats reads the selected candidate pair's and the datagram
-// channel's counters from the browser's stats into r.
+// rampChannelOptions adjusts the options of the datagrams' channel for
+// a test: with tailcatTestHooks.rampReliable, it is reliable and
+// ordered, to tell the channel's partial reliability from the rest of
+// SCTP when diagnosing a stall.
+func rampChannelOptions(s *rtcSession, opts map[string]any) {
+	if s.hooks.Truthy() && s.hooks.Get("rampReliable").Truthy() {
+		delete(opts, "ordered")
+		delete(opts, "maxRetransmits")
+	}
+}
+
+// rampWireStats reads the transport's, the selected candidate pair's and
+// the datagram channel's counters from the browser's stats into r.
 func rampWireStats(s *rtcSession, r *rampRTCSample) {
 	r.WireSent, r.WireRecv, r.PktsSent, r.PktsRecv, r.ICERTTms, r.DCSent, r.DCMsgSent = -1, -1, -1, -1, -1, -1, -1
 	p, err := jsCall(s.pc, "getStats")
@@ -147,6 +167,11 @@ func rampWireStats(s *rtcSession, r *rampRTCSample) {
 			if v := st.Get("selectedCandidatePairId"); v.Type() == js.TypeString {
 				pairID = v.String()
 			}
+			// The transport's counters, not the selected pair's: through
+			// the test's relays each side may receive on a pair other than
+			// the one it selected.
+			r.WireSent, r.WireRecv = num(st, "bytesSent"), num(st, "bytesReceived")
+			r.PktsSent, r.PktsRecv = num(st, "packetsSent"), num(st, "packetsReceived")
 		case "data-channel":
 			if st.Get("label").String() == dataChannelName {
 				r.DCSent, r.DCMsgSent = num(st, "bytesSent"), num(st, "messagesSent")
@@ -160,8 +185,6 @@ func rampWireStats(s *rtcSession, r *rampRTCSample) {
 		return
 	}
 	if st, ok := byID[pairID]; ok {
-		r.WireSent, r.WireRecv = num(st, "bytesSent"), num(st, "bytesReceived")
-		r.PktsSent, r.PktsRecv = num(st, "packetsSent"), num(st, "packetsReceived")
 		if rtt := num(st, "currentRoundTripTime"); rtt >= 0 {
 			r.ICERTTms = rtt * 1000
 		}
