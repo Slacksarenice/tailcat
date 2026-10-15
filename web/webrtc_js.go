@@ -411,12 +411,12 @@ type rtcSession struct {
 	// dcRaw and ctlRaw are the channels' raw I/O handles (rawio_js.go),
 	// or 0 to use syscall/js. dcBuffered is the datagrams' channel's
 	// bufferedAmount as its last raw call returned it, at dcBufferedAt.
-	dcRaw, ctlRaw  int32
-	dcBuffered     int
-	dcBufferedAt   time.Time
-	recvScratch    []byte   // used only by onMessage, a JS callback
-	everQualified  bool
-	qualifiedAt    time.Time
+	dcRaw, ctlRaw int32
+	dcBuffered    int
+	dcBufferedAt  time.Time
+	recvScratch   []byte // used only by onMessage, a JS callback
+	everQualified bool
+	qualifiedAt   time.Time
 }
 
 func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic, signal net.Conn, iceServers js.Value, notify pathNotifier,
@@ -1009,48 +1009,21 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 // can't take that way.
 func (s *rtcSession) onMessages(ch js.Value, h int32) {
 	slow := s.handler("onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
-	var err error
-	switch {
-	case h == 0 || rawIOMode == "send":
+	if h == 0 || rawIOMode == "send" {
 		ch.Set("onmessage", slow)
 		return
-	case rawIOMode == "func":
-		got := s.handler("raw onmessage", func(n js.Value) {
-			if n := n.Int(); n >= frameHeaderLen && n <= len(s.recvScratch) {
-				s.onFrame(s.recvScratch[:n], false)
-			}
-		})
-		_, err = jsCall(rawIO, "recv", h, uintptr(unsafe.Pointer(unsafe.SliceData(s.recvScratch))), len(s.recvScratch), got, slow)
-	default:
-		in := &rawInbox{buf: make([]byte, rawInboxHeader+maxFrame), wake: make(chan struct{}, 1)}
-		rawInboxes[h] = in
-		go s.drain(in)
-		_, err = jsCall(rawIO, "recvInbox", h, uintptr(unsafe.Pointer(unsafe.SliceData(in.buf))), maxFrame, slow)
 	}
-	if err != nil {
+	// Both channels share recvScratch: JS fills it and calls got, which
+	// handles the message before returning, and messages come one at a
+	// time.
+	got := s.handler("raw onmessage", func(n js.Value) {
+		if n := n.Int(); n >= frameHeaderLen && n <= len(s.recvScratch) {
+			s.onFrame(s.recvScratch[:n], false)
+		}
+	})
+	scratch := uintptr(unsafe.Pointer(unsafe.SliceData(s.recvScratch)))
+	if _, err := jsCall(rawIO, "recv", h, scratch, len(s.recvScratch), got, slow); err != nil {
 		ch.Set("onmessage", slow)
-	}
-}
-
-// drain handles the messages tailcatRecv puts in inbox in (see
-// rawInbox), until the session ends.
-func (s *rtcSession) drain(in *rawInbox) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.logf("webrtc: raw onmessage: %v", r)
-			s.close()
-		}
-	}()
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-in.wake:
-		}
-		if n := int(binary.LittleEndian.Uint32(in.buf)); n >= frameHeaderLen {
-			s.onFrame(in.buf[rawInboxHeader:rawInboxHeader+n], false)
-		}
-		binary.LittleEndian.PutUint32(in.buf, 0)
 	}
 }
 
