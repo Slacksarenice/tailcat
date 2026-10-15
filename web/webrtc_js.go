@@ -60,6 +60,7 @@ import (
 	"sync"
 	"syscall/js"
 	"time"
+	"unsafe"
 
 	"github.com/tailscale/tailcat"
 	"github.com/tailscale/tailcat/internal/rtcpolicy"
@@ -140,6 +141,9 @@ const (
 	hardBuffered = 8 << 20
 	shedEvery    = 100 * time.Millisecond
 	maxFrame     = frameHeaderLen + 65535
+	// maxBufferedAge is how old a bufferedAmount that a raw I/O send
+	// returned may be before the Shedder's next decision reads it afresh.
+	maxBufferedAge = time.Millisecond
 
 	// qualifyTimeout is how long, from the start of signaling, a
 	// session may take to qualify its channel before either side gives
@@ -404,9 +408,15 @@ type rtcSession struct {
 	heldCands      []signalMsg // and send them after it
 	sendScratch    []byte
 	sendBuf        js.Value // reusable Uint8Array for outgoing frames
-	recvScratch    []byte   // used only by onMessage, a JS callback
-	everQualified  bool
-	qualifiedAt    time.Time
+	// dcRaw and ctlRaw are the channels' raw I/O handles (rawio_js.go),
+	// or 0 to use syscall/js. dcBuffered is the datagrams' channel's
+	// bufferedAmount as its last raw call returned it, at dcBufferedAt.
+	dcRaw, ctlRaw int32
+	dcBuffered    int
+	dcBufferedAt  time.Time
+	recvScratch   []byte // used only by onMessage, a JS callback
+	everQualified bool
+	qualifiedAt   time.Time
 }
 
 func newRTCSession(parent context.Context, logf logger.Logf, peer key.NodePublic, signal net.Conn, iceServers js.Value, notify pathNotifier,
@@ -588,24 +598,30 @@ func (s *rtcSession) createDataChannel(label string, opts map[string]any) (js.Va
 // panic in fn, which would otherwise end the program and every tunnel
 // in it, ends just this session.
 func (s *rtcSession) on(target js.Value, prop string, fn func(ev js.Value)) {
+	target.Set(prop, s.handler(prop, fn))
+}
+
+// handler returns a JS function that calls fn with its first argument,
+// remembered for release; see on.
+func (s *rtcSession) handler(name string, fn func(arg js.Value)) js.Func {
 	f := js.FuncOf(func(this js.Value, args []js.Value) any {
 		defer func() {
 			if r := recover(); r != nil {
-				s.logf("webrtc: %s handler: %v", prop, r)
+				s.logf("webrtc: %s handler: %v", name, r)
 				s.close()
 			}
 		}()
-		ev := js.Undefined()
+		arg := js.Undefined()
 		if len(args) > 0 {
-			ev = args[0]
+			arg = args[0]
 		}
-		fn(ev)
+		fn(arg)
 		return nil
 	})
 	s.mu.Lock()
 	s.funcs = append(s.funcs, f)
 	s.mu.Unlock()
-	target.Set(prop, f)
+	return f
 }
 
 // sendSignal queues a signaling line without blocking, since it is
@@ -848,12 +864,13 @@ func (s *rtcSession) acceptChannel() {
 
 func (s *rtcSession) attachChannel(dc js.Value) {
 	dc.Set("binaryType", "arraybuffer")
+	h := rawAttach(dc)
 	s.mu.Lock()
-	s.dc = dc
+	s.dc, s.dcRaw = dc, h
 	s.mu.Unlock()
 	s.on(dc, "onopen", func(js.Value) { go s.qualify() })
 	s.on(dc, "onclose", func(js.Value) { go s.close() })
-	s.on(dc, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	s.onMessages(dc, h)
 	if dc.Get("readyState").String() == "open" {
 		go s.qualify()
 	}
@@ -864,11 +881,12 @@ func (s *rtcSession) attachChannel(dc js.Value) {
 // rest of the session.
 func (s *rtcSession) attachControl(ctl js.Value) {
 	ctl.Set("binaryType", "arraybuffer")
+	h := rawAttach(ctl)
 	s.mu.Lock()
-	s.ctl = ctl
+	s.ctl, s.ctlRaw = ctl, h
 	s.ctlSeen = true
 	s.mu.Unlock()
-	s.on(ctl, "onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	s.onMessages(ctl, h)
 	opened := func() {
 		if s.hooks.Truthy() {
 			s.hooks.Set("ctlOpen", true)
@@ -881,9 +899,10 @@ func (s *rtcSession) attachControl(ctl js.Value) {
 	s.on(ctl, "onclose", func(js.Value) {
 		s.mu.Lock()
 		if s.ctl.Equal(ctl) {
-			s.ctl = js.Undefined()
+			s.ctl, s.ctlRaw = js.Undefined(), 0
 		}
 		s.mu.Unlock()
+		rawDetach(h)
 	})
 }
 
@@ -891,15 +910,47 @@ func isOpen(ch js.Value) bool {
 	return !ch.IsUndefined() && ch.Get("readyState").String() == "open"
 }
 
-// sendFrameLocked sends frame on channel ch. It reports false if the
-// channel isn't open.
-func (s *rtcSession) sendFrameLocked(ch js.Value, frame []byte) bool {
+// sendFrameLocked sends frame on channel ch, whose raw I/O handle is h
+// (0 for none). It reports false if the channel isn't open.
+func (s *rtcSession) sendFrameLocked(ch js.Value, h int32, frame []byte, now time.Time) bool {
+	if h != 0 {
+		r := rawSend(h, frame)
+		if r < 0 {
+			return false
+		}
+		if h == s.dcRaw {
+			s.dcBuffered, s.dcBufferedAt = int(r), now
+		}
+		return true
+	}
 	if !isOpen(ch) {
 		return false
 	}
 	n := js.CopyBytesToJS(s.sendBuf, frame)
 	_, err := jsCall(ch, "send", s.sendBuf.Call("subarray", 0, n))
 	return err == nil
+}
+
+// bufferedLocked returns the datagrams' channel's bufferedAmount. With
+// raw I/O, that is what the last send returned, unless older than
+// maxBufferedAge: the queue has only drained since, so the Shedder sees
+// at most that long's drain more than is there.
+func (s *rtcSession) bufferedLocked(now time.Time) int {
+	if s.dcRaw == 0 {
+		return s.dc.Get("bufferedAmount").Int()
+	}
+	if now.Sub(s.dcBufferedAt) > maxBufferedAge {
+		s.refreshBufferedLocked(now)
+	}
+	return s.dcBuffered
+}
+
+// refreshBufferedLocked reads the datagrams' channel's bufferedAmount
+// afresh, with raw I/O.
+func (s *rtcSession) refreshBufferedLocked(now time.Time) {
+	if r := rawSend(s.dcRaw, nil); r >= 0 {
+		s.dcBuffered, s.dcBufferedAt = int(r), now
+	}
 }
 
 // sendControl sends a probe, ping or answer. Probes and their answers
@@ -913,11 +964,11 @@ func (s *rtcSession) sendControl(typ byte, seq uint32, size int) {
 	clear(b)
 	b[0] = typ
 	binary.BigEndian.PutUint32(b[1:], seq)
-	ch := s.dc
+	ch, h := s.dc, s.dcRaw
 	if (typ == framePing || typ == framePong) && isOpen(s.ctl) {
-		ch = s.ctl
+		ch, h = s.ctl, s.ctlRaw
 	}
-	s.sendFrameLocked(ch, b)
+	s.sendFrameLocked(ch, h, b, time.Now())
 }
 
 // sendWG is the PacketPath send function. Until the channel qualifies,
@@ -928,14 +979,19 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	if !s.qualified || s.live.Suspect() || frameHeaderLen+len(pkt) > maxFrame {
 		return false
 	}
-	if s.shed.Drop(s.dc.Get("bufferedAmount").Int(), frameHeaderLen+len(pkt), time.Now()) {
+	now := time.Now()
+	if s.shed.Drop(s.bufferedLocked(now), frameHeaderLen+len(pkt), now) {
 		s.dropped++
+		if s.dcRaw != 0 {
+			// Nothing was sent to bring back the channel's bufferedAmount.
+			s.refreshBufferedLocked(now)
+		}
 		return true // dropped: inner TCP slows down
 	}
 	b := s.sendScratch[:frameHeaderLen+len(pkt)]
 	b[0] = frameWG
 	copy(b[frameHeaderLen:], pkt)
-	if !s.sendFrameLocked(s.dc, b) {
+	if !s.sendFrameLocked(s.dc, s.dcRaw, b, now) {
 		// The channel is gone; end the session, which withdraws the
 		// path and tells the page, rather than leave it half up.
 		s.qualified = false
@@ -944,6 +1000,31 @@ func (s *rtcSession) sendWG(pkt []byte) bool {
 	}
 	s.sentBytes += int64(len(pkt))
 	return true
+}
+
+// onMessages handles channel ch's messages. With raw I/O (handle h),
+// its onmessage is tailcatRawIO's: that copies each message into
+// recvScratch and calls Go with its length, rather than Go reading the
+// event through syscall/js, and hands Go the event only for what it
+// can't take that way.
+func (s *rtcSession) onMessages(ch js.Value, h int32) {
+	slow := s.handler("onmessage", func(ev js.Value) { s.onMessage(ev.Get("data")) })
+	if h == 0 || rawIOMode == "send" {
+		ch.Set("onmessage", slow)
+		return
+	}
+	// Both channels share recvScratch: JS fills it and calls got, which
+	// handles the message before returning, and messages come one at a
+	// time.
+	got := s.handler("raw onmessage", func(n js.Value) {
+		if n := n.Int(); n >= frameHeaderLen && n <= len(s.recvScratch) {
+			s.onFrame(s.recvScratch[:n], false)
+		}
+	})
+	scratch := uintptr(unsafe.Pointer(unsafe.SliceData(s.recvScratch)))
+	if _, err := jsCall(rawIO, "recv", h, scratch, len(s.recvScratch), got, slow); err != nil {
+		ch.Set("onmessage", slow)
+	}
 }
 
 // onMessage handles a DataChannel message. It runs in a JS callback,
@@ -964,6 +1045,14 @@ func (s *rtcSession) onMessage(data js.Value) {
 	}
 	b := s.recvScratch[:n]
 	js.CopyBytesToGo(b, jsUint8Array.New(data))
+	s.onFrame(b, true)
+}
+
+// onFrame handles frame b, a message received. delayHook is whether the
+// test hook delayMs may apply; raw I/O hands messages it would delay to
+// onMessage instead. It runs in a JS callback, so it must not block.
+func (s *rtcSession) onFrame(b []byte, delayHook bool) {
+	n := len(b)
 	switch b[0] {
 	case frameWG:
 		s.mu.Lock()
@@ -971,7 +1060,7 @@ func (s *rtcSession) onMessage(data js.Value) {
 		s.recvBytes += int64(n - frameHeaderLen)
 		s.live.Heard(time.Now())
 		s.mu.Unlock()
-		if p != nil && s.hooks.Truthy() {
+		if p != nil && delayHook && s.hooks.Truthy() {
 			// A test simulating a longer path: hold each datagram
 			// delayMs before WireGuard sees it. Only the tunnel's TCP
 			// sees the longer round trip; the DataChannel's SCTP, and
@@ -1484,9 +1573,13 @@ func (s *rtcSession) teardown() {
 	path := s.path
 	s.path, s.qualified = nil, false
 	dc, ctl := s.dc, s.ctl
+	dcRaw, ctlRaw := s.dcRaw, s.ctlRaw
+	s.dcRaw, s.ctlRaw = 0, 0
 	funcs := s.funcs
 	s.funcs = nil
 	s.mu.Unlock()
+	rawDetach(dcRaw)
+	rawDetach(ctlRaw)
 	if path != nil {
 		path.Close()
 	}
